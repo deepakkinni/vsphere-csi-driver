@@ -397,3 +397,13 @@ push-ci-image:
 
 print-ci-image:
 	@$(MAKE) --no-print-directory -C images/ci print
+
+################################################################################
+##                              SNAPSHOTTER IMAGE                             ##
+################################################################################
+.PHONY: build-snap-images
+build-snap-images: build
+	$(MAKE) -C hack/images/snapshotter build
+
+print-snap-images:
+	@$(MAKE) --no-print-directory -C hack/images/snapshotter print

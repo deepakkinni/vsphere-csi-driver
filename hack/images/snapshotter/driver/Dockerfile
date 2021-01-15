@@ -1,0 +1,40 @@
+# Copyright 2019 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This build arg allows the specification of a custom base image.
+ARG BASE_IMAGE=gcr.io/cloud-provider-vsphere/extra/csi-driver-base:latest
+
+################################################################################
+##                               MAIN STAGE                                   ##
+################################################################################
+FROM ${BASE_IMAGE}
+LABEL "maintainers"="Divyen Patel <divyenp@vmware.com>, Sandeep Pissay Srinivasa Rao <ssrinivas@vmware.com>, Xing Yang <yangxi@vmware.com>"
+
+# install nfs-utils, util-linux and e2fsprogs
+# nfs-utils  : The nfs-utils package contains simple nfs client service.
+# util-linux : Utilities for handling file systems, consoles, partitions.
+# e2fsprogs  : The E2fsprogs package contains the utilities for handling the ext file system.
+
+RUN tdnf -y install \
+  nfs-utils \
+  util-linux \
+  e2fsprogs
+
+
+# Remove cached data
+RUN tdnf clean all
+
+COPY /.build/bin/vsphere-csi.linux_amd64 /bin/vsphere-csi
+
+ENTRYPOINT ["/bin/vsphere-csi"]
