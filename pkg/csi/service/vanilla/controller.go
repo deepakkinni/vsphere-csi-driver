@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang/protobuf/ptypes"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/fsnotify/fsnotify"
 	"github.com/vmware/govmomi/cns"
@@ -75,6 +77,7 @@ var (
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 	}
 )
 
@@ -953,7 +956,61 @@ func (c *controller) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshot
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
 	log.Infof("CreateSnapshot: called with args %+v", *req)
-	return nil, status.Error(codes.Unimplemented, "")
+
+	// Validate arguments
+	volumeID := req.GetSourceVolumeId()
+	if len(req.Name) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Snapshot name must be provided")
+	}
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot Source Volume ID must be provided")
+	}
+
+	// TODO(xyang): check if snapshot already exists
+	// supports idemponency
+
+	// Check if volume exists
+	volumeIds := []cnstypes.CnsVolumeId{{Id: volumeID}}
+	queryFilter := cnstypes.CnsQueryFilter{
+		VolumeIds: volumeIds,
+	}
+	queryResult, err := c.manager.VolumeManager.QueryVolume(ctx, queryFilter)
+	if err != nil {
+		log.Errorf("Failed to call QueryVolume for volumeID: %q: %v", volumeID, err)
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	var currentSize int64
+	if len(queryResult.Volumes) > 0 {
+		currentSize = queryResult.Volumes[0].BackingObjectDetails.(cnstypes.BaseCnsBackingObjectDetails).GetCnsBackingObjectDetails().CapacityInMb
+	} else {
+		msg := fmt.Sprintf("failed to find volume by querying volumeID: %q", volumeID)
+		log.Error(msg)
+		return nil, status.Errorf(codes.Internal, msg)
+	}
+
+	// TODO: use createTime from CreateSnapshotUtil
+	snapshotID, createTime, err := common.CreateSnapshotUtil(ctx, c.manager, volumeID, req.Name)
+	if err != nil {
+		log.Errorf("Failed to Create Snapshot for volumeID: %q: %v", volumeID, err)
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	timeProto, err := ptypes.TimestampProto(*createTime)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("Failed to covert creation timestamp: %v", err))
+	}
+
+	createResp := &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SizeBytes:      currentSize * common.GbInBytes, // TODO
+			SnapshotId:     snapshotID,
+			SourceVolumeId: volumeID,
+			CreationTime:   timeProto, // TODO
+			ReadyToUse:     true,
+		},
+	}
+	log.Infof("CreateSnapshot succeeded for snapshot %s on volume %s size %d Time proto %d Timestamp %+v Response: %+v", snapshotID, volumeID, currentSize*common.GbInBytes, timeProto, *createTime, createResp)
+
+	return createResp, nil
 }
 
 func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (
@@ -961,7 +1018,31 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
 	log.Infof("DeleteSnapshot: called with args %+v", *req)
-	return nil, status.Error(codes.Unimplemented, "")
+
+	// Validate arguments
+	fullSnapshotid := req.GetSnapshotId()
+	if len(fullSnapshotid) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "DeleteSnapshot Snapshot ID must be provided")
+	}
+	// TODO: full_snapshotID is in this format: <volumeID:<snapshotID>
+	// Parse the full snapshot id
+	IDs := strings.Split(fullSnapshotid, ":")
+	if len(IDs) == 0 || len(IDs) != 2 {
+		return nil, status.Error(codes.InvalidArgument, "DeleteSnapshot provided invalid Snapshot ID")
+	}
+	volumeID := IDs[0]
+	snapshotID := IDs[1]
+	log.Infof("DeleteSnapshot: snapshot id %q volume id %q", snapshotID, volumeID)
+
+	err := common.DeleteSnapshotUtil(ctx, c.manager, volumeID, snapshotID)
+	if err != nil {
+		msg := fmt.Sprintf("Failed to delete snapshot %q on volume %q. Error: %+v", snapshotID, volumeID, err)
+		log.Error(msg)
+		return nil, status.Errorf(codes.Internal, msg)
+	}
+
+	log.Infof("DeleteSnapshot: successfully deleted snapshot %q on volume %q", snapshotID, volumeID)
+	return &csi.DeleteSnapshotResponse{}, nil
 }
 
 func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (

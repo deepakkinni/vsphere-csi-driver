@@ -69,6 +69,10 @@ type Manager interface {
 	QueryAllVolume(ctx context.Context, queryFilter cnstypes.CnsQueryFilter, querySelection cnstypes.CnsQuerySelection) (*cnstypes.CnsQueryResult, error)
 	// RelocateVolume migrates volumes to their target datastore as specified in relocateSpecList
 	RelocateVolume(ctx context.Context, relocateSpecList ...cnstypes.BaseCnsVolumeRelocateSpec) (*object.Task, error)
+	// CreateSnapshot invokes a snapshot on a block volume
+	CreateSnapshot(ctx context.Context, volumeID string, desc string) (string, string, string, *time.Time, error)
+	// DeleteSnapshot deletes a block volume snapshot.
+	DeleteSnapshot(ctx context.Context, volumeID string, snapshotID string) error
 	// ExpandVolume expands a volume to a new size.
 	ExpandVolume(ctx context.Context, volumeID string, size int64) error
 	// ResetManager helps set new manager instance and VC configuration
@@ -762,4 +766,135 @@ func (m *defaultManager) RelocateVolume(ctx context.Context, relocateSpecList ..
 		return nil, err
 	}
 	return res, err
+}
+
+func (m *defaultManager) CreateSnapshot(ctx context.Context, volumeID string, desc string) (string, string, string, *time.Time, error) {
+	log := logger.GetLogger(ctx)
+	err := validateManager(ctx, m)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	// Set up the VC connection
+	err = m.virtualCenter.ConnectCns(ctx)
+	if err != nil {
+		log.Errorf("ConnectCns failed with err: %+v", err)
+		return "", "", "", nil, err
+	}
+
+	// Construct the CNS SnapshotCreateSpec list
+	var cnsSnapshotCreateSpecList []cnstypes.CnsSnapshotCreateSpec
+	cnsSnapshotCreateSpec := cnstypes.CnsSnapshotCreateSpec{
+		VolumeId: cnstypes.CnsVolumeId{
+			Id: volumeID,
+		},
+		Description: desc,
+	}
+	cnsSnapshotCreateSpecList = append(cnsSnapshotCreateSpecList, cnsSnapshotCreateSpec)
+
+	// Call the CNS CreateSnapshots
+	log.Infof("Calling CnsClient.CreateSnapshots: VolumeID [%q] Description [%q] cnsSnapshotCreateSpecList [%#v]", volumeID, desc, cnsSnapshotCreateSpecList)
+	createSnapshotsTask, err := m.virtualCenter.CnsClient.CreateSnapshots(ctx, cnsSnapshotCreateSpecList)
+	if err != nil {
+		log.Errorf("CNS CreateSnapshots failed from vCenter %q with err: %v", m.virtualCenter.Config.Host, err)
+		return "", "", "", nil, err
+	}
+
+	// Get the taskInfo
+	createSnapshotsTaskInfo, err := cns.GetTaskInfo(ctx, createSnapshotsTask)
+	if err != nil || createSnapshotsTaskInfo == nil {
+		log.Errorf("Failed to get taskInfo for CreateSnapshots task from vCenter %q with err: %v", m.virtualCenter.Config.Host, err)
+		return "", "", "", nil, err
+	}
+	log.Infof("CreateSnapshots: VolumeID: %q, opId: %q", volumeID, createSnapshotsTaskInfo.ActivationId)
+
+	// Get the taskResult
+	createSnapshotsTaskResult, err := cns.GetTaskResult(ctx, createSnapshotsTaskInfo)
+	if err != nil || createSnapshotsTaskResult == nil {
+		log.Errorf("unable to find the task result for CreateSnapshots task from vCenter %q. taskID: %q, opId: %q createResults: %+v",
+			m.virtualCenter.Config.Host, createSnapshotsTaskInfo.Task.Value, createSnapshotsTaskInfo.ActivationId, createSnapshotsTaskResult)
+		return "", "", "", nil, err
+	}
+
+	// Handle snapshot operation result
+	createSnapshotsOperationRes := createSnapshotsTaskResult.GetCnsVolumeOperationResult()
+	if createSnapshotsOperationRes.Fault != nil {
+		errorMsg := fmt.Sprintf("failed to create snapshots for cns volume %s. fault: %q, opId: %q", volumeID, spew.Sdump(createSnapshotsOperationRes.Fault), createSnapshotsTaskInfo.ActivationId)
+		log.Error(errorMsg)
+		return "", "", "", nil, errors.New(errorMsg)
+	}
+
+	snapshotCreateResult := interface{}(createSnapshotsTaskResult).(*cnstypes.CnsSnapshotCreateResult)
+	snapshotID := snapshotCreateResult.Snapshot.SnapshotId.Id
+	snapshotVolumeID := snapshotCreateResult.Snapshot.VolumeId.Id
+	snapshotDescription := snapshotCreateResult.Snapshot.Description
+	snapshotCreateTime := snapshotCreateResult.Snapshot.CreateTime
+
+	log.Infof("CreateSnapshot: Snapshot created successfully. SnapshotID: %q, SnapshotCreateTime: %q, opId: %q", snapshotID, snapshotCreateTime, createSnapshotsTaskInfo.ActivationId)
+
+	return snapshotID, snapshotVolumeID, snapshotDescription, &snapshotCreateTime, err
+}
+
+func (m *defaultManager) DeleteSnapshot(ctx context.Context, volumeID string, snapshotID string) error {
+	log := logger.GetLogger(ctx)
+	err := validateManager(ctx, m)
+	if err != nil {
+		return err
+	}
+	// Set up the VC connection
+	err = m.virtualCenter.ConnectCns(ctx)
+	if err != nil {
+		log.Errorf("ConnectCns failed with err: %+v", err)
+		return err
+	}
+
+	// Construct the CNS SnapshotDeleteSpec list
+	var cnsSnapshotDeleteSpecList []cnstypes.CnsSnapshotDeleteSpec
+	cnsSnapshotDeleteSpec := cnstypes.CnsSnapshotDeleteSpec{
+		VolumeId: cnstypes.CnsVolumeId{
+			Id: volumeID,
+		},
+		SnapshotId: cnstypes.CnsSnapshotId{
+			Id: snapshotID,
+		},
+	}
+	cnsSnapshotDeleteSpecList = append(cnsSnapshotDeleteSpecList, cnsSnapshotDeleteSpec)
+
+	// Call the CNS DeleteSnapshots
+	log.Infof("Calling CnsClient.DeleteSnapshots: VolumeID [%q] SnapshotID [%q] cnsSnapshotDeleteSpecList [%#v]", volumeID, snapshotID, cnsSnapshotDeleteSpec)
+	deleteSnapshotsTask, err := m.virtualCenter.CnsClient.DeleteSnapshots(ctx, cnsSnapshotDeleteSpecList)
+	if err != nil {
+		log.Errorf("CNS DeleteSnapshots failed from vCenter %q with err: %v", m.virtualCenter.Config.Host, err)
+		return err
+	}
+
+	// Get the taskInfo
+	deleteSnapshotsTaskInfo, err := cns.GetTaskInfo(ctx, deleteSnapshotsTask)
+	if err != nil || deleteSnapshotsTaskInfo == nil {
+		log.Errorf("Failed to get taskInfo for DeleteSnapshots task from vCenter %q with err: %v", m.virtualCenter.Config.Host, err)
+		return err
+	}
+	log.Infof("DeleteSnapshots: VolumeID: %q, SnapshotID: %q, opId: %q", volumeID, snapshotID, deleteSnapshotsTaskInfo.ActivationId)
+
+	// Get the taskResult
+	deleteSnapshotsTaskResult, err := cns.GetTaskResult(ctx, deleteSnapshotsTaskInfo)
+	if err != nil || deleteSnapshotsTaskResult == nil {
+		log.Errorf("unable to find the task result for DeleteSnapshots task from vCenter %q. taskID: %q, opId: %q createResults: %+v",
+			m.virtualCenter.Config.Host, deleteSnapshotsTaskInfo.Task.Value, deleteSnapshotsTaskInfo.ActivationId, deleteSnapshotsTaskResult)
+		return err
+	}
+
+	// Handle snapshot operation result
+	deleteSnapshotsOperationRes := deleteSnapshotsTaskResult.GetCnsVolumeOperationResult()
+	if deleteSnapshotsOperationRes.Fault != nil {
+		errorMsg := fmt.Sprintf("failed to delete snapshot %s for cns volume %s. fault: %q, opId: %q", snapshotID, volumeID, spew.Sdump(deleteSnapshotsOperationRes.Fault), deleteSnapshotsTaskInfo.ActivationId)
+		log.Error(errorMsg)
+		return errors.New(errorMsg)
+	}
+
+	snapshotDeleteResult := interface{}(deleteSnapshotsTaskResult).(*cnstypes.CnsSnapshotDeleteResult)
+	deletedSnapshotID := snapshotDeleteResult.SnapshotId.Id
+
+	log.Infof("DeleteSnapshot: Snapshot %s deleted successfully. volumeID: %q, opId: %q", deletedSnapshotID, volumeID, deleteSnapshotsTaskInfo.ActivationId)
+
+	return nil
 }
