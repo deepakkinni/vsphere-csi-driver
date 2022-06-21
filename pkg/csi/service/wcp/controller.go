@@ -806,6 +806,7 @@ func (c *controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
 	volumeType := prometheus.PrometheusUnknownVolumeType
+	cnsVolumeType := common.UnknownVolumeType
 
 	deleteVolumeInternal := func() (
 		*csi.DeleteVolumeResponse, string, error) {
@@ -821,6 +822,38 @@ func (c *controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 			msg := fmt.Sprintf("Validation for DeleteVolume Request: %+v has failed. Error: %+v", *req, err)
 			log.Error(msg)
 			return nil, csifault.CSIInvalidArgumentFault, err
+		}
+		if cnsVolumeType == common.UnknownVolumeType {
+			cnsVolumeType, err = common.GetCnsVolumeType(ctx, c.manager, req.VolumeId)
+			if err != nil {
+				if err.Error() == common.ErrNotFound.Error() {
+					// The volume couldn't be found during query, assuming the delete operation as success
+					return &csi.DeleteVolumeResponse{}, "", nil
+				} else {
+					return nil, csifault.CSIInternalFault, logger.LogNewErrorCodef(log, codes.Internal,
+						"failed to determine CNS volume type for volume: %q. Error: %+v", req.VolumeId, err)
+				}
+			}
+			volumeType = convertCnsVolumeType(ctx, cnsVolumeType)
+		}
+		// Check if the volume contains CNS snapshots only for block volumes.
+		if cnsVolumeType == common.BlockVolumeType &&
+			commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshotWCP) {
+			snapshots, _, err := common.QueryVolumeSnapshotsByVolumeID(ctx, c.manager.VolumeManager, req.VolumeId,
+				common.QuerySnapshotLimit)
+			if err != nil {
+				return nil, csifault.CSIInternalFault, logger.LogNewErrorCodef(log, codes.Internal,
+					"failed to retrieve snapshots for volume: %s. Error: %+v", req.VolumeId, err)
+			}
+			if len(snapshots) == 0 {
+				log.Infof("no CNS snapshots found for volume: %s, the volume can be safely deleted",
+					req.VolumeId)
+			} else {
+				return nil, csifault.CSIInternalFault, logger.LogNewErrorCodef(log, codes.FailedPrecondition,
+					"volume: %s with existing snapshots %v cannot be deleted, "+
+						"please delete snapshots before deleting the volume", req.VolumeId, snapshots)
+			}
+
 		}
 		// TODO: Add code to determine the volume type and set volumeType for
 		// Prometheus metric accordingly.
@@ -848,6 +881,17 @@ func (c *controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 	}
 	return resp, err
 }
+
+func convertCnsVolumeType(ctx context.Context, cnsVolumeType string) string {
+	volumeType := prometheus.PrometheusUnknownVolumeType
+	if cnsVolumeType == common.BlockVolumeType {
+		volumeType = prometheus.PrometheusBlockVolumeType
+	} else if cnsVolumeType == common.FileVolumeType {
+		volumeType = prometheus.PrometheusFileVolumeType
+	}
+	return volumeType
+}
+
 
 // ControllerPublishVolume attaches a volume to the Node VM.
 // Volume id and node name is retrieved from ControllerPublishVolumeRequest.
