@@ -45,13 +45,14 @@ func GetFakeContainerOrchestratorInterface(orchestratorType int) (commonco.COCom
 	if orchestratorType == common.Kubernetes {
 		fakeCO := &FakeK8SOrchestrator{
 			featureStates: map[string]string{
-				"volume-extend":         "true",
-				"volume-health":         "true",
-				"csi-migration":         "true",
-				"file-volume":           "true",
-				"block-volume-snapshot": "true",
-				"tkgs-ha":               "true",
-				"list-volumes":          "true",
+				"volume-extend":             "true",
+				"volume-health":             "true",
+				"csi-migration":             "true",
+				"file-volume":               "true",
+				"block-volume-snapshot":     "true",
+				"tkgs-ha":                   "true",
+				"list-volumes":              "true",
+				"block-volume-snapshot-wcp": "true",
 			},
 		}
 		return fakeCO, nil
