@@ -182,6 +182,23 @@ spec:
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
+        - name: csi-snapshotter
+          image: vmware.io/csi-snapshotter:<image_tag>
+          args:
+            - "--v=4"
+            - "--timeout=300s"
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            - "--kube-api-qps=100"
+            - "--kube-api-burst=100"
+            - "--extra-create-metadata"
+          imagePullPolicy: "IfNotPresent"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
         - name: vsphere-csi-controller
           image: vmware.io/vsphere-csi:<image_tag>
           args:
@@ -476,7 +493,7 @@ data:
   "online-volume-extend": "true"
   "file-volume": "true"
   "csi-sv-feature-states-replication": "false"
-  "block-volume-snapshot": "false"
+  "block-volume-snapshot": "true"
   "tkgs-ha": "true"
   "cnsmgr-suspend-create-volume": "false"
 kind: ConfigMap
