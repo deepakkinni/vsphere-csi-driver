@@ -1426,7 +1426,35 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
 	log.Infof("DeleteSnapshot: called with args %+v", *req)
-	return nil, status.Error(codes.Unimplemented, "")
+	isBlockVolumeSnapshotWCPEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshotWCP)
+	if !isBlockVolumeSnapshotWCPEnabled {
+		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "deleteSnapshot")
+	}
+	deleteSnapshotInternal := func() (*csi.DeleteSnapshotResponse, error) {
+		csiSnapshotID := req.GetSnapshotId()
+		err := common.DeleteSnapshotUtil(ctx, c.manager, csiSnapshotID)
+		if err != nil {
+			return nil, logger.LogNewErrorCodef(log, codes.Internal,
+				"Failed to delete WCP snapshot %q. Error: %+v",
+				csiSnapshotID, err)
+		}
+
+		log.Infof("DeleteSnapshot: successfully deleted snapshot %q", csiSnapshotID)
+		return &csi.DeleteSnapshotResponse{}, nil
+	}
+
+	volumeType := prometheus.PrometheusBlockVolumeType
+	start := time.Now()
+	resp, err := deleteSnapshotInternal()
+	if err != nil {
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusDeleteSnapshotOpType,
+			prometheus.PrometheusFailStatus, "NotComputed").Observe(time.Since(start).Seconds())
+	} else {
+		log.Infof("Snapshot %q deleted successfully.", req.SnapshotId)
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusDeleteSnapshotOpType,
+			prometheus.PrometheusPassStatus, "").Observe(time.Since(start).Seconds())
+	}
+	return resp, err
 }
 
 func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (
