@@ -1462,8 +1462,50 @@ func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRe
 
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
+	volumeType := prometheus.PrometheusBlockVolumeType
 	log.Infof("ListSnapshots: called with args %+v", *req)
-	return nil, status.Error(codes.Unimplemented, "")
+	isBlockVolumeSnapshotWCPEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshotWCP)
+	if !isBlockVolumeSnapshotWCPEnabled {
+		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "listSnapshot")
+	}
+	listSnapshotsInternal := func() (*csi.ListSnapshotsResponse, error) {
+		err := validateWCPListSnapshotRequest(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		maxEntries := common.QuerySnapshotLimit
+		if req.MaxEntries != 0 {
+			maxEntries = int64(req.MaxEntries)
+		}
+		snapshots, nextToken, err := common.ListSnapshotsUtil(ctx, c.manager.VolumeManager, req.SourceVolumeId,
+			req.SnapshotId, req.StartingToken, maxEntries)
+		if err != nil {
+			return nil, logger.LogNewErrorCodef(log, codes.Internal, " failed to retrieve the snapshots, err: %+v", err)
+		}
+		var entries []*csi.ListSnapshotsResponse_Entry
+		for _, snapshot := range snapshots {
+			entry := &csi.ListSnapshotsResponse_Entry{
+				Snapshot: snapshot,
+			}
+			entries = append(entries, entry)
+		}
+		resp := &csi.ListSnapshotsResponse{
+			Entries:   entries,
+			NextToken: nextToken,
+		}
+		log.Infof("ListSnapshot served %d results, token for next set: %s", len(entries), nextToken)
+		return resp, nil
+	}
+	start := time.Now()
+	resp, err := listSnapshotsInternal()
+	if err != nil {
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusListSnapshotsOpType,
+			prometheus.PrometheusFailStatus, "NotComputed").Observe(time.Since(start).Seconds())
+	} else {
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusListSnapshotsOpType,
+			prometheus.PrometheusPassStatus, "").Observe(time.Since(start).Seconds())
+	}
+	return resp, err
 }
 
 // ControllerExpandVolume expands a volume.
