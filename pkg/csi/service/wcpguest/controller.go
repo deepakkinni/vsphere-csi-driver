@@ -1406,8 +1406,59 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 	*csi.DeleteSnapshotResponse, error) {
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
-	log.Infof("DeleteSnapshot: called with args %+v", *req)
-	return nil, status.Error(codes.Unimplemented, "")
+	start := time.Now()
+	volumeType := prometheus.PrometheusBlockVolumeType
+	log.Infof("CreateSnapshot: called with args %+v", *req)
+	isBlockVolumeSnapshotWCPEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshotWCP)
+	if !isBlockVolumeSnapshotWCPEnabled {
+		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "createSnapshot")
+	}
+	deleteSnapshotInternal := func() (*csi.DeleteSnapshotResponse, error) {
+		csiSnapshotID := req.GetSnapshotId()
+		// Retrieve the supervisor volumesnapshot
+		supervisorVolumeSnapshotName := req.SnapshotId
+		supervisorVolumeSnapshot, err := c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).Get(
+			ctx, supervisorVolumeSnapshotName, metav1.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				log.Infof("The supervisor volumesnapshot %s/%s was not found in the supervisor cluster, " +
+					"assuming successfull delete", c.supervisorNamespace, supervisorVolumeSnapshotName)
+			} else {
+				msg := fmt.Sprintf("failed to retrieve the supervisor volumesnapshot %s/%s, Error: %+v",
+					c.supervisorNamespace, supervisorVolumeSnapshotName, err)
+				log.Error(msg)
+				return nil, status.Errorf(codes.Internal, msg)
+			}
+		}
+		log.Infof("Found the supervisor volumesnapshot %s on the supervisor cluster",
+			supervisorVolumeSnapshot.Name)
+		err = c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).Delete(
+			ctx, supervisorVolumeSnapshotName, *metav1.NewDeleteOptions(0))
+		if err != nil {
+			if errors.IsNotFound(err) {
+				log.Infof("The supervisor volumesnapshot %s/%s was not found in the supervisor cluster " +
+					"while deleting it, assuming successfull delete",
+					c.supervisorNamespace, supervisorVolumeSnapshotName)
+				return &csi.DeleteSnapshotResponse{}, nil
+			}
+			msg := fmt.Sprintf("failed to delete the supervisor volumesnapshot %s/%s, Error: %+v",
+				c.supervisorNamespace, supervisorVolumeSnapshotName, err)
+			log.Error(msg)
+			return nil, status.Errorf(codes.Internal, msg)
+		}
+		log.Infof("DeleteSnapshot: successfully deleted snapshot %q", csiSnapshotID)
+		return &csi.DeleteSnapshotResponse{}, nil
+	}
+	resp, err := deleteSnapshotInternal()
+	if err != nil {
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusDeleteSnapshotOpType,
+			prometheus.PrometheusFailStatus, "NotComputed").Observe(time.Since(start).Seconds())
+	} else {
+		log.Infof("Snapshot %q deleted successfully.", req.SnapshotId)
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusDeleteSnapshotOpType,
+			prometheus.PrometheusPassStatus, "").Observe(time.Since(start).Seconds())
+	}
+	return resp, err
 }
 
 func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (
