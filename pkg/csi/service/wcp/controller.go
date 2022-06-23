@@ -1474,6 +1474,8 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
 	log.Infof("DeleteSnapshot: called with args %+v", *req)
+	volumeType := prometheus.PrometheusBlockVolumeType
+	start := time.Now()
 	isBlockVolumeSnapshotWCPEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshotWCP)
 	if !isBlockVolumeSnapshotWCPEnabled {
 		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "deleteSnapshot")
@@ -1490,9 +1492,6 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 		log.Infof("DeleteSnapshot: successfully deleted snapshot %q", csiSnapshotID)
 		return &csi.DeleteSnapshotResponse{}, nil
 	}
-
-	volumeType := prometheus.PrometheusBlockVolumeType
-	start := time.Now()
 	resp, err := deleteSnapshotInternal()
 	if err != nil {
 		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusDeleteSnapshotOpType,

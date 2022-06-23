@@ -55,6 +55,9 @@ const (
 	// For example: StorageClassName: "silver".
 	AttributeSupervisorStorageClass = "svstorageclass"
 
+	// AttributeSupervisorVolumeSnapshotClass represents name of VolumeSnapshotClass
+	AttributeSupervisorVolumeSnapshotClass = "svvolumesnapshotclass"
+
 	// AttributeStorageTopologyType is a storageClass parameter.
 	// It represents a zonal or a crossZonal volume provisioning.
 	// For example: StorageTopologyType: "zonal"

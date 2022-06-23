@@ -18,6 +18,8 @@ package wcpguest
 
 import (
 	"fmt"
+	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -65,13 +67,14 @@ var (
 )
 
 type controller struct {
-	supervisorClient          clientset.Interface
-	restClientConfig          *rest.Config
-	vmOperatorClient          client.Client
-	cnsOperatorClient         client.Client
-	vmWatcher                 *cache.ListWatch
-	supervisorNamespace       string
-	tanzukubernetesClusterUID string
+	supervisorClient            clientset.Interface
+	supervisorSnapshotterClient snapshotterClientSet.Interface
+	restClientConfig            *rest.Config
+	vmOperatorClient            client.Client
+	cnsOperatorClient           client.Client
+	vmWatcher                   *cache.ListWatch
+	supervisorNamespace         string
+	tanzukubernetesClusterUID   string
 }
 
 // New creates a CNS controller
@@ -94,6 +97,12 @@ func (c *controller) Init(config *cnsconfig.Config, version string) error {
 	c.supervisorClient, err = k8s.NewSupervisorClient(ctx, c.restClientConfig)
 	if err != nil {
 		log.Errorf("failed to create supervisorClient. Error: %+v", err)
+		return err
+	}
+
+	c.supervisorSnapshotterClient, err = k8s.NewSupervisorSnapshotClient(ctx, c.restClientConfig)
+	if err != nil {
+		log.Errorf("failed to create supervisorSnapshotterClient. Error: %+v", err)
 		return err
 	}
 
@@ -194,6 +203,11 @@ func (c *controller) ReloadConfiguration() error {
 		c.supervisorClient, err = k8s.NewSupervisorClient(ctx, c.restClientConfig)
 		if err != nil {
 			log.Errorf("failed to create supervisorClient. Error: %+v", err)
+			return err
+		}
+		c.supervisorSnapshotterClient, err = k8s.NewSupervisorSnapshotClient(ctx, c.restClientConfig)
+		if err != nil {
+			log.Errorf("failed to create supervisorSnapshotterClient. Error: %+v", err)
 			return err
 		}
 		log.Infof("successfully re-created supervisorClient using updated configuration")
@@ -1281,8 +1295,111 @@ func (c *controller) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshot
 	*csi.CreateSnapshotResponse, error) {
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
+	start := time.Now()
+	volumeType := prometheus.PrometheusBlockVolumeType
 	log.Infof("CreateSnapshot: called with args %+v", *req)
-	return nil, status.Error(codes.Unimplemented, "")
+	isBlockVolumeSnapshotWCPEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshotWCP)
+	if !isBlockVolumeSnapshotWCPEnabled {
+		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "createSnapshot")
+	}
+	createSnapshotInternal := func() (*csi.CreateSnapshotResponse, error) {
+		// Search for supervisor PVC and ensure it exists
+		supervisorPVCName := req.SourceVolumeId
+		log.Infof("Checking if supervisor PVC %s/%s exists..", c.supervisorNamespace, supervisorPVCName)
+		_, err := c.supervisorClient.CoreV1().PersistentVolumeClaims(c.supervisorNamespace).Get(
+			ctx, supervisorPVCName, metav1.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				log.Errorf("the supervisor PVC: %s/%s was not found while attempting to take snapshot",
+					c.supervisorNamespace, supervisorPVCName)
+			}
+			return nil, err
+		}
+		// Get supervisor VolumeSnapshotClass.
+		var supervisorVolumeSnapshotClass string
+		for param := range req.Parameters {
+			paramName := strings.ToLower(param)
+			if paramName == common.AttributeSupervisorVolumeSnapshotClass {
+				supervisorVolumeSnapshotClass = req.Parameters[param]
+			}
+		}
+		// Generate the supervisor VolumeSnapshot name
+		// Assuming snapshot prefix is "snapshot-"
+		supervisorVolumeSnapshotName := c.tanzukubernetesClusterUID + "-" + req.Name[9:]
+		log.Infof("Determined VolumeSnapshotClass: %s for the supervisor VolumeSnapshot: %s",
+			supervisorVolumeSnapshotClass, supervisorVolumeSnapshotName)
+		log.Infof("Looking for VolumeSnapshot %s in supervisor namespace: %s ..",
+			supervisorVolumeSnapshotName, c.supervisorNamespace)
+
+		_, err = c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).Get(
+			ctx, supervisorVolumeSnapshotName, metav1.GetOptions{})
+		if err != nil {
+			if errors.IsNotFound(err) {
+				// New createSnapshot request on the guest
+				supVolumeSnapshot := getVolumeSnapshotWithVolumeSnapshotClass(supervisorVolumeSnapshotName,
+					c.supervisorNamespace, supervisorVolumeSnapshotClass, supervisorPVCName)
+				log.Infof("Supervisosr VolumeSnapshot Spec: %+v", supVolumeSnapshot)
+				_, err = c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(
+					c.supervisorNamespace).Create(ctx, supVolumeSnapshot, metav1.CreateOptions{})
+				if err != nil {
+					msg := fmt.Sprintf("failed to create volumesnapshot with name: %s on namespace: %s in supervisorCluster. Error: %+v",
+						supervisorVolumeSnapshotName, c.supervisorNamespace, err)
+					log.Error(msg)
+					return nil, status.Errorf(codes.Internal, msg)
+				}
+				log.Infof("Successfully created VolumeSnapshot %s on the supervisor cluster",
+					supervisorVolumeSnapshotName)
+			} else {
+				msg := fmt.Sprintf("failed to get volumesnapshot with name: %s on namespace: %s in supervisorCluster. Error: %+v",
+					supervisorVolumeSnapshotName, c.supervisorNamespace, err)
+				log.Error(msg)
+				return nil, status.Errorf(codes.Internal, msg)
+			}
+		}
+		// Wait for VolumeSnapshot to be ready to us
+		// TODO: Change the timeout setting
+		isReady, err := isVolumeSnapshotInSupervisorClusterReady(ctx, c.supervisorSnapshotterClient,
+			supervisorVolumeSnapshotName, c.supervisorNamespace,
+			time.Duration(getProvisionTimeoutInMin(ctx))*time.Minute)
+		if !isReady {
+			msg := fmt.Sprintf("failed to create volumesnapshot: %s on namespace: %s in supervisor cluster. "+
+				"Error: %+v", supervisorVolumeSnapshotName, c.supervisorNamespace, err)
+			log.Error(msg)
+			return nil, status.Errorf(codes.Internal, msg)
+		}
+		// The VolumeSnapshot on the supervisor is in a ReadyToUse state.
+		vs, err := c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).Get(
+			ctx, supervisorVolumeSnapshotName, metav1.GetOptions{})
+		if err != nil {
+			msg := fmt.Sprintf("failed to get volumesnapshot with name: %s on namespace: %s in supervisorCluster "+
+				"after being ready. Error: %+v", supervisorVolumeSnapshotName, c.supervisorNamespace, err)
+			log.Error(msg)
+			return nil, status.Errorf(codes.Internal, msg)
+		}
+		snapshotCreateTimeInProto := timestamppb.New(vs.Status.CreationTime.Time)
+		snapshotSize := vs.Status.RestoreSize.Value()
+		createSnapshotResponse := &csi.CreateSnapshotResponse{
+			Snapshot: &csi.Snapshot{
+				SizeBytes:      snapshotSize,
+				SnapshotId:     supervisorVolumeSnapshotName,
+				SourceVolumeId: req.SourceVolumeId,
+				CreationTime:   snapshotCreateTimeInProto,
+				ReadyToUse:     true,
+			},
+		}
+		return createSnapshotResponse, nil
+	}
+
+	resp, err := createSnapshotInternal()
+	if err != nil {
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusCreateSnapshotOpType,
+			prometheus.PrometheusFailStatus, "NotComputed").Observe(time.Since(start).Seconds())
+	} else {
+		log.Infof("Snapshot for volume %q created successfully.", req.GetSourceVolumeId())
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusCreateSnapshotOpType,
+			prometheus.PrometheusPassStatus, "").Observe(time.Since(start).Seconds())
+	}
+	return resp, err
 }
 
 func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (
