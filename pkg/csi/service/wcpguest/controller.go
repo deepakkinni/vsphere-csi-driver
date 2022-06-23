@@ -1411,7 +1411,7 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 	log.Infof("CreateSnapshot: called with args %+v", *req)
 	isBlockVolumeSnapshotWCPEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshot)
 	if !isBlockVolumeSnapshotWCPEnabled {
-		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "createSnapshot")
+		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "deleteSnapshot")
 	}
 	deleteSnapshotInternal := func() (*csi.DeleteSnapshotResponse, error) {
 		csiSnapshotID := req.GetSnapshotId()
@@ -1466,8 +1466,80 @@ func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRe
 
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
+	start := time.Now()
+	volumeType := prometheus.PrometheusBlockVolumeType
 	log.Infof("ListSnapshots: called with args %+v", *req)
-	return nil, status.Error(codes.Unimplemented, "")
+	isBlockVolumeSnapshotWCPEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshot)
+	if !isBlockVolumeSnapshotWCPEnabled {
+		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "createSnapshot")
+	}
+	listSnapshotsInternal := func() (*csi.ListSnapshotsResponse, error) {
+		log.Infof("ListSnapshots: called with args %+v", *req)
+		maxEntries := common.QuerySnapshotLimit
+		if req.MaxEntries != 0 {
+			maxEntries = int64(req.MaxEntries)
+		}
+		log.Infof("Setting the max entries to %d", maxEntries)
+		snapshotID := req.SnapshotId
+		volumeID := req.SourceVolumeId
+		if snapshotID != "" {
+			vs, err := c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).Get(
+				ctx, snapshotID, metav1.GetOptions{})
+			if err != nil {
+				msg := fmt.Sprintf("failed to get volumesnapshot with name: %s on namespace: %s in supervisorCluster "+
+					"after being ready. Error: %+v", snapshotID, c.supervisorNamespace, err)
+				log.Error(msg)
+				return nil, status.Errorf(codes.Internal, msg)
+			}
+			// TODO: retrieve the volid from annotation.
+			volID := ""
+			var snapshots []*csi.Snapshot
+			snapshotCreateTimeInProto := timestamppb.New(vs.Status.CreationTime.Time)
+			snapshotSize := vs.Status.RestoreSize.Value()
+			csiSnapshotInfo := &csi.Snapshot{
+				SnapshotId:     snapshotID,
+				SourceVolumeId: volID,
+				CreationTime:   snapshotCreateTimeInProto,
+				SizeBytes:      snapshotSize,
+				ReadyToUse:     true,
+			}
+			snapshots = append(snapshots, csiSnapshotInfo)
+			var entries []*csi.ListSnapshotsResponse_Entry
+			for _, snapshot := range snapshots {
+				entry := &csi.ListSnapshotsResponse_Entry{
+					Snapshot: snapshot,
+				}
+				entries = append(entries, entry)
+			}
+			resp := &csi.ListSnapshotsResponse{
+				Entries:   entries,
+			}
+			return resp, nil
+		} else if volumeID != "" {
+			// Retrieve all the snapshots for the specific volume
+			_, err := c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).
+				List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, logger.LogNewErrorCodef(log, codes.Internal,
+					"failed to retrieve all the volumesnapshot objects from supervisor cluster %s", c.supervisorNamespace)
+			}
+			// TODO: retrieve annotations and determine if it's the right volume
+			return  &csi.ListSnapshotsResponse{}, nil
+		} else {
+			return nil, logger.LogNewErrorCodef(log, codes.Unimplemented,
+				"ListSnapshot queries to retrieve all the snapshots in the inventory is currently not supported")
+		}
+
+	}
+	resp, err := listSnapshotsInternal()
+	if err != nil {
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusListSnapshotsOpType,
+			prometheus.PrometheusFailStatus, "NotComputed").Observe(time.Since(start).Seconds())
+	} else {
+		prometheus.CsiControlOpsHistVec.WithLabelValues(volumeType, prometheus.PrometheusListSnapshotsOpType,
+			prometheus.PrometheusPassStatus, "").Observe(time.Since(start).Seconds())
+	}
+	return resp, err
 }
 
 func (c *controller) ControllerGetVolume(ctx context.Context, req *csi.ControllerGetVolumeRequest) (
