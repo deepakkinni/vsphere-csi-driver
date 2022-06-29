@@ -20,14 +20,15 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"io/ioutil"
 	"log"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/google/uuid"
@@ -791,7 +792,6 @@ func TestWCPExpandVolumeWithSnapshots(t *testing.T) {
 		},
 		VolumeCapability: capabilities[0],
 	}
-
 
 	_, err = ct.controller.ControllerExpandVolume(ctx, reqExpand)
 	if err != nil {

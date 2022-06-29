@@ -45,14 +45,13 @@ func GetFakeContainerOrchestratorInterface(orchestratorType int) (commonco.COCom
 	if orchestratorType == common.Kubernetes {
 		fakeCO := &FakeK8SOrchestrator{
 			featureStates: map[string]string{
-				"volume-extend":             "true",
-				"volume-health":             "true",
-				"csi-migration":             "true",
-				"file-volume":               "true",
-				"block-volume-snapshot":     "true",
-				"tkgs-ha":                   "true",
-				"list-volumes":              "true",
-				"block-volume-snapshot-wcp": "true",
+				"volume-extend":         "true",
+				"volume-health":         "true",
+				"csi-migration":         "true",
+				"file-volume":           "true",
+				"block-volume-snapshot": "true",
+				"tkgs-ha":               "true",
+				"list-volumes":          "true",
 			},
 		}
 		return fakeCO, nil
@@ -258,4 +257,10 @@ func (c *FakeK8SOrchestrator) GetAllVolumes() []string {
 // GetAllK8sVolumes returns list of volumes in a bound state, present in the K8s cluster
 func (c *FakeK8SOrchestrator) GetAllK8sVolumes() []string {
 	return nil
+}
+
+// AnnotateVolumeSnapshot annotates the volumesnapshot CR in k8s cluster
+func (c *FakeK8SOrchestrator) AnnotateVolumeSnapshot(ctx context.Context, volumeSnapshotName string,
+	volumeSnapshotNamespace string, annotations map[string]string) (bool, error) {
+	return true, nil
 }

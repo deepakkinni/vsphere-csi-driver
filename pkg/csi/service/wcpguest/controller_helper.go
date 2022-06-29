@@ -20,12 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	snap "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
-	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	snap "github.com/kubernetes-csi/external-snapshotter/client/v4/apis/volumesnapshot/v1"
+	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -218,7 +219,8 @@ func getPersistentVolumeClaimSpecWithStorageClass(pvcName string, namespace stri
 	return claim
 }
 
-func getVolumeSnapshotWithVolumeSnapshotClass(volumeSnapshotName string, namespace string, volumeSnapshotClassName string, pvcName string) *snap.VolumeSnapshot {
+func getVolumeSnapshotWithVolumeSnapshotClass(volumeSnapshotName string, namespace string,
+	volumeSnapshotClassName string, pvcName string) *snap.VolumeSnapshot {
 	volumeSnapshot := &snap.VolumeSnapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      volumeSnapshotName,
@@ -247,7 +249,8 @@ func isVolumeSnapshotInSupervisorClusterReady(ctx context.Context, client snapsh
 	isReadyToUse := false
 
 	waitErr := wait.PollImmediate(5*time.Second, timeout, func() (done bool, err error) {
-		svs, err := client.SnapshotV1().VolumeSnapshots(namespace).Get(ctx, supervisorVolumeSnapshotName,metav1.GetOptions{})
+		svs, err := client.SnapshotV1().VolumeSnapshots(namespace).
+			Get(ctx, supervisorVolumeSnapshotName, metav1.GetOptions{})
 		if err != nil {
 			msg := fmt.Sprintf("unable to fetch volumesnapshot %q/%q "+
 				"from supervisor cluster with err: %+v",

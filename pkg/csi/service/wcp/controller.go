@@ -18,13 +18,14 @@ package wcp
 
 import (
 	"fmt"
-	"github.com/vmware/govmomi/vim25/types"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/vmware/govmomi/vim25/types"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/davecgh/go-spew/spew"
@@ -892,7 +893,6 @@ func convertCnsVolumeType(ctx context.Context, cnsVolumeType string) string {
 	return volumeType
 }
 
-
 // ControllerPublishVolume attaches a volume to the Node VM.
 // Volume id and node name is retrieved from ControllerPublishVolumeRequest.
 func (c *controller) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (
@@ -1452,6 +1452,21 @@ func (c *controller) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshot
 			"on volume %s size %d Time proto %+v Timestamp %+v Response: %+v",
 			snapshotID, volumeID, snapshotSizeInMB*common.MbInBytes, snapshotCreateTimeInProto,
 			*snapshotCreateTimePtr, createSnapshotResponse)
+
+		log.Infof("Attempting to annotate the associated volumesnapshot request with FCD and Snapshot " +
+			"annotation..")
+
+		volumeSnapshotName := req.Parameters[common.VolumeSnapshotNameKey]
+		volumeSnapshotNamespace := req.Parameters[common.VolumeSnapshotNamespaceKey]
+
+		log.Infof("Attempting to annotate volumesnapshot %s/%s with %s",
+			volumeSnapshotNamespace, volumeSnapshotName, snapshotID)
+		annotated, err := commonco.ContainerOrchestratorUtility.AnnotateVolumeSnapshot(ctx, volumeSnapshotNamespace,
+			volumeSnapshotName, map[string]string{common.VolumeSnapshotInfoKey: snapshotID})
+		if err != nil || !annotated {
+			log.Errorf("failed to annotate volumesnapshot %s, however, the snapshot %s was created"+
+				". Error: %v", volumeSnapshotName, snapshotID, err)
+		}
 		return createSnapshotResponse, nil
 	}
 

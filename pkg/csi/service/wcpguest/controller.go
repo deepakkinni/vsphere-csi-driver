@@ -18,13 +18,14 @@ package wcpguest
 
 import (
 	"fmt"
-	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	snapshotterClientSet "github.com/kubernetes-csi/external-snapshotter/client/v4/clientset/versioned"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/davecgh/go-spew/spew"
@@ -1342,8 +1343,8 @@ func (c *controller) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshot
 				_, err = c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(
 					c.supervisorNamespace).Create(ctx, supVolumeSnapshot, metav1.CreateOptions{})
 				if err != nil {
-					msg := fmt.Sprintf("failed to create volumesnapshot with name: %s on namespace: %s in supervisorCluster. Error: %+v",
-						supervisorVolumeSnapshotName, c.supervisorNamespace, err)
+					msg := fmt.Sprintf("failed to create volumesnapshot with name: %s on namespace: %s "+
+						"in supervisorCluster. Error: %+v", supervisorVolumeSnapshotName, c.supervisorNamespace, err)
 					log.Error(msg)
 					return nil, status.Errorf(codes.Internal, msg)
 				}
@@ -1375,6 +1376,19 @@ func (c *controller) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshot
 				"after being ready. Error: %+v", supervisorVolumeSnapshotName, c.supervisorNamespace, err)
 			log.Error(msg)
 			return nil, status.Errorf(codes.Internal, msg)
+		}
+		// Extract the fcd-id + snapshot-id annotation from the supervisor volumesnapshot CR
+		snapshotID := vs.Annotations[common.VolumeSnapshotInfoKey]
+		volumeSnapshotName := req.Parameters[common.VolumeSnapshotNameKey]
+		volumeSnapshotNamespace := req.Parameters[common.VolumeSnapshotNamespaceKey]
+
+		log.Infof("Attempting to annotate Guest volumesnapshot %s/%s with %s",
+			volumeSnapshotNamespace, volumeSnapshotName, snapshotID)
+		annotated, err := commonco.ContainerOrchestratorUtility.AnnotateVolumeSnapshot(ctx, volumeSnapshotNamespace,
+			volumeSnapshotName, map[string]string{common.VolumeSnapshotInfoKey: snapshotID})
+		if err != nil || !annotated {
+			log.Errorf("failed to annotate volumesnapshot %s, however, the snapshot %s was created"+
+				". Error: %v", volumeSnapshotName, snapshotID, err)
 		}
 		snapshotCreateTimeInProto := timestamppb.New(vs.Status.CreationTime.Time)
 		snapshotSize := vs.Status.RestoreSize.Value()
@@ -1417,12 +1431,12 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 		csiSnapshotID := req.GetSnapshotId()
 		// Retrieve the supervisor volumesnapshot
 		supervisorVolumeSnapshotName := req.SnapshotId
-		supervisorVolumeSnapshot, err := c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).Get(
-			ctx, supervisorVolumeSnapshotName, metav1.GetOptions{})
+		supervisorVolumeSnapshot, err := c.supervisorSnapshotterClient.SnapshotV1().
+			VolumeSnapshots(c.supervisorNamespace).Get(ctx, supervisorVolumeSnapshotName, metav1.GetOptions{})
 		if err != nil {
 			if errors.IsNotFound(err) {
-				log.Infof("The supervisor volumesnapshot %s/%s was not found in the supervisor cluster, " +
-					"assuming successfull delete", c.supervisorNamespace, supervisorVolumeSnapshotName)
+				log.Infof("The supervisor volumesnapshot %s/%s was not found in the supervisor cluster, "+
+					"assuming successful delete", c.supervisorNamespace, supervisorVolumeSnapshotName)
 			} else {
 				msg := fmt.Sprintf("failed to retrieve the supervisor volumesnapshot %s/%s, Error: %+v",
 					c.supervisorNamespace, supervisorVolumeSnapshotName, err)
@@ -1436,8 +1450,8 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 			ctx, supervisorVolumeSnapshotName, *metav1.NewDeleteOptions(0))
 		if err != nil {
 			if errors.IsNotFound(err) {
-				log.Infof("The supervisor volumesnapshot %s/%s was not found in the supervisor cluster " +
-					"while deleting it, assuming successfull delete",
+				log.Infof("The supervisor volumesnapshot %s/%s was not found in the supervisor cluster "+
+					"while deleting it, assuming successful delete",
 					c.supervisorNamespace, supervisorVolumeSnapshotName)
 				return &csi.DeleteSnapshotResponse{}, nil
 			}
@@ -1512,7 +1526,7 @@ func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRe
 				entries = append(entries, entry)
 			}
 			resp := &csi.ListSnapshotsResponse{
-				Entries:   entries,
+				Entries: entries,
 			}
 			return resp, nil
 		} else if volumeID != "" {
@@ -1524,7 +1538,7 @@ func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRe
 					"failed to retrieve all the volumesnapshot objects from supervisor cluster %s", c.supervisorNamespace)
 			}
 			// TODO: retrieve annotations and determine if it's the right volume
-			return  &csi.ListSnapshotsResponse{}, nil
+			return &csi.ListSnapshotsResponse{}, nil
 		} else {
 			return nil, logger.LogNewErrorCodef(log, codes.Unimplemented,
 				"ListSnapshot queries to retrieve all the snapshots in the inventory is currently not supported")

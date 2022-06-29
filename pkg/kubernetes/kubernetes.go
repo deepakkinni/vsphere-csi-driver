@@ -159,15 +159,16 @@ func NewSupervisorClient(ctx context.Context, config *restclient.Config) (client
 }
 
 // NewSupervisorSnapshotClient creates a new supervisor client for handling snapshot related objects
-func NewSupervisorSnapshotClient(ctx context.Context, config *restclient.Config) (snapshotterClientSet.Interface, error) {
+func NewSupervisorSnapshotClient(ctx context.Context, config *restclient.Config) (
+	snapshotterClientSet.Interface, error) {
 	log := logger.GetLogger(ctx)
-	log.Info("Connecting to supervisor cluster using the certs/token in Guest Cluster config to retrieve the snapshotter client")
+	log.Info("Connecting to supervisor cluster using the certs/token in Guest Cluster " +
+		"config to retrieve the snapshotter client")
 	client, err := snapshotterClientSet.NewForConfig(config)
 	if err != nil {
 		log.Error("failed to connect to the supervisor cluster with err: %+v", err)
 		return nil, err
 	}
-
 	return client, nil
 
 }
