@@ -513,24 +513,60 @@ func (c *controller) createBlockVolume(ctx context.Context, req *csi.CreateVolum
 			log.Debugf("Setting the affineToHost value as %s", affineToHost)
 		}
 	}
-
+	candidateDatastores := append(sharedDatastores, vsanDirectDatastores...)
 	// Volume Size - Default is 10 GiB.
 	volSizeBytes := int64(common.DefaultGbDiskSize * common.GbInBytes)
 	if req.GetCapacityRange() != nil && req.GetCapacityRange().RequiredBytes != 0 {
 		volSizeBytes = int64(req.GetCapacityRange().GetRequiredBytes())
 	}
 	volSizeMB := int64(common.RoundUpSize(volSizeBytes, common.MbInBytes))
+	isBlockVolumeSnapshotEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshot)
+	// Check if requested volume size and source snapshot size matches
+	volumeSource := req.GetVolumeContentSource()
+	var contentSourceSnapshotID string
+	if isBlockVolumeSnapshotEnabled && volumeSource != nil {
+		sourceSnapshot := volumeSource.GetSnapshot()
+		if sourceSnapshot == nil {
+			return nil, csifault.CSIInvalidArgumentFault,
+				logger.LogNewErrorCode(log, codes.InvalidArgument, "unsupported VolumeContentSource type")
+		}
+		contentSourceSnapshotID = sourceSnapshot.GetSnapshotId()
+
+		cnsVolumeID, _, err := common.ParseCSISnapshotID(contentSourceSnapshotID)
+		if err != nil {
+			return nil, csifault.CSIInvalidArgumentFault,
+				logger.LogNewErrorCode(log, codes.InvalidArgument, err.Error())
+		}
+		// Query capacity in MB and datastore url for block volume snapshot
+		volumeIds := []cnstypes.CnsVolumeId{{Id: cnsVolumeID}}
+		cnsVolumeDetailsMap, err := utils.QueryVolumeDetailsUtil(ctx, c.manager.VolumeManager, volumeIds)
+		if err != nil {
+			log.Errorf("failed to retrieve the volume: %s details. err: %+v", cnsVolumeID, err)
+			return nil, csifault.CSIInternalFault, err
+		}
+		if _, ok := cnsVolumeDetailsMap[cnsVolumeID]; !ok {
+			return nil, csifault.CSIInternalFault, logger.LogNewErrorCodef(log, codes.Internal,
+				"cns query volume did not return the volume: %s", cnsVolumeID)
+		}
+		snapshotSizeInMB := cnsVolumeDetailsMap[cnsVolumeID].SizeInMB
+		snapshotSizeInBytes := snapshotSizeInMB * common.MbInBytes
+		if volSizeBytes != snapshotSizeInBytes {
+			return nil, csifault.CSIInvalidArgumentFault, logger.LogNewErrorCodef(log, codes.InvalidArgument,
+				"size mismatches, requested volume size %d and source snapshot size %d",
+				volSizeBytes, snapshotSizeInBytes)
+		}
+	}
 	// Create CreateVolumeSpec and populate values.
 	var createVolumeSpec = common.CreateVolumeSpec{
-		CapacityMB:             volSizeMB,
-		Name:                   req.Name,
-		StoragePolicyID:        storagePolicyID,
-		ScParams:               &common.StorageClassParams{},
-		AffineToHost:           affineToHost,
-		VolumeType:             common.BlockVolumeType,
-		VsanDirectDatastoreURL: selectedDatastoreURL,
+		CapacityMB:              volSizeMB,
+		Name:                    req.Name,
+		StoragePolicyID:         storagePolicyID,
+		ScParams:                &common.StorageClassParams{},
+		AffineToHost:            affineToHost,
+		VolumeType:              common.BlockVolumeType,
+		VsanDirectDatastoreURL:  selectedDatastoreURL,
+		ContentSourceSnapshotID: contentSourceSnapshotID,
 	}
-	candidateDatastores := append(sharedDatastores, vsanDirectDatastores...)
 	volumeInfo, faultType, err := common.CreateBlockVolumeUtil(ctx, cnstypes.CnsClusterFlavorWorkload,
 		c.manager, &createVolumeSpec, candidateDatastores, filterSuspendedDatastores, isTKGSHAEnabled)
 	if err != nil {
