@@ -1477,7 +1477,6 @@ func (c *controller) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshot
 
 func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (
 	*csi.ListSnapshotsResponse, error) {
-
 	ctx = logger.NewContextWithLogger(ctx)
 	log := logger.GetLogger(ctx)
 	start := time.Now()
@@ -1485,15 +1484,21 @@ func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRe
 	log.Infof("ListSnapshots: called with args %+v", *req)
 	isBlockVolumeSnapshotWCPEnabled := commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshot)
 	if !isBlockVolumeSnapshotWCPEnabled {
-		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "createSnapshot")
+		return nil, logger.LogNewErrorCode(log, codes.Unimplemented, "listSnapshot")
 	}
 	listSnapshotsInternal := func() (*csi.ListSnapshotsResponse, error) {
 		log.Infof("ListSnapshots: called with args %+v", *req)
 		maxEntries := common.QuerySnapshotLimit
 		if req.MaxEntries != 0 {
-			maxEntries = int64(req.MaxEntries)
+			log.Warnf("Specifying MaxEntries in ListSnapshotRequest is not supported,"+
+				" will return %d entries", maxEntries)
+			// TODO: Support specifying max entries when result pagination is supported.
+			//maxEntries = int64(req.MaxEntries)
 		}
 		log.Infof("Setting the max entries to %d", maxEntries)
+		// Within the Guest:
+		// snapshotID: supervisor volumesnapshot name
+		// volumeID: supervisor PVC name
 		snapshotID := req.SnapshotId
 		volumeID := req.SourceVolumeId
 		if snapshotID != "" {
@@ -1505,8 +1510,8 @@ func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRe
 				log.Error(msg)
 				return nil, status.Errorf(codes.Internal, msg)
 			}
-			// TODO: retrieve the volid from annotation.
-			volID := ""
+			// Retrieve the volumeID, i.e, supervisor pvc name from the volumesnapshot spec.
+			volID := *vs.Spec.Source.PersistentVolumeClaimName
 			var snapshots []*csi.Snapshot
 			snapshotCreateTimeInProto := timestamppb.New(vs.Status.CreationTime.Time)
 			snapshotSize := vs.Status.RestoreSize.Value()
@@ -1531,19 +1536,68 @@ func (c *controller) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRe
 			return resp, nil
 		} else if volumeID != "" {
 			// Retrieve all the snapshots for the specific volume
-			_, err := c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).
+			vsList, err := c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).
 				List(ctx, metav1.ListOptions{})
 			if err != nil {
 				return nil, logger.LogNewErrorCodef(log, codes.Internal,
 					"failed to retrieve all the volumesnapshot objects from supervisor cluster %s", c.supervisorNamespace)
 			}
-			// TODO: retrieve annotations and determine if it's the right volume
-			return &csi.ListSnapshotsResponse{}, nil
+			var snapshots []*csi.Snapshot
+			var entries []*csi.ListSnapshotsResponse_Entry
+			for _, vs := range vsList.Items {
+				supPVCName := *vs.Spec.Source.PersistentVolumeClaimName
+				if supPVCName == volumeID {
+					snapshotCreateTimeInProto := timestamppb.New(vs.Status.CreationTime.Time)
+					snapshotSize := vs.Status.RestoreSize.Value()
+					csiSnapshotInfo := &csi.Snapshot{
+						SnapshotId:     vs.Name,
+						SourceVolumeId: volumeID,
+						CreationTime:   snapshotCreateTimeInProto,
+						SizeBytes:      snapshotSize,
+						ReadyToUse:     true,
+					}
+					snapshots = append(snapshots, csiSnapshotInfo)
+					entry := &csi.ListSnapshotsResponse_Entry {
+						Snapshot: csiSnapshotInfo,
+					}
+					entries = append(entries, entry)
+				}
+			}
+			resp := &csi.ListSnapshotsResponse {
+				Entries: entries,
+			}
+			return resp, nil
 		} else {
-			return nil, logger.LogNewErrorCodef(log, codes.Unimplemented,
-				"ListSnapshot queries to retrieve all the snapshots in the inventory is currently not supported")
+			vsList, err := c.supervisorSnapshotterClient.SnapshotV1().VolumeSnapshots(c.supervisorNamespace).
+				List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return nil, logger.LogNewErrorCodef(log, codes.Internal,
+					"failed to retrieve all the volumesnapshot objects from supervisor cluster %s", c.supervisorNamespace)
+			}
+			var snapshots []*csi.Snapshot
+			var entries []*csi.ListSnapshotsResponse_Entry
+			for _, vs := range vsList.Items {
+				supPVCName := *vs.Spec.Source.PersistentVolumeClaimName
+				snapshotCreateTimeInProto := timestamppb.New(vs.Status.CreationTime.Time)
+				snapshotSize := vs.Status.RestoreSize.Value()
+				csiSnapshotInfo := &csi.Snapshot{
+					SnapshotId:     vs.Name,
+					SourceVolumeId: supPVCName,
+					CreationTime:   snapshotCreateTimeInProto,
+					SizeBytes:      snapshotSize,
+					ReadyToUse:     true,
+				}
+				snapshots = append(snapshots, csiSnapshotInfo)
+				entry := &csi.ListSnapshotsResponse_Entry{
+					Snapshot: csiSnapshotInfo,
+				}
+				entries = append(entries, entry)
+			}
+			resp := &csi.ListSnapshotsResponse {
+				Entries: entries,
+			}
+			return resp, nil
 		}
-
 	}
 	resp, err := listSnapshotsInternal()
 	if err != nil {
