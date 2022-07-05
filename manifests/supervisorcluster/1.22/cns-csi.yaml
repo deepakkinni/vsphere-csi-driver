@@ -250,6 +250,22 @@ spec:
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
+        - name: csi-snapshotter
+          image: localhost:5000/vmware.io/csi-snapshotter:v5.0.1_vmware.1
+          args:
+            - '--v=4'
+            - '--kube-api-qps=100'
+            - '--kube-api-burst=100'
+            - '--timeout=300s'
+            - '--csi-address=\$(ADDRESS)'
+            - '--extra-create-metadata'
+            - '--leader-election'
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - mountPath: /csi
+              name: socket-dir
         - name: csi-attacher
           image: localhost:5000/vmware.io/csi-attacher:v3.4.0_vmware.1
           args:
