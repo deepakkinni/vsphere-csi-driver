@@ -273,7 +273,7 @@ func (c *controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 			volSizeBytes = int64(req.GetCapacityRange().GetRequiredBytes())
 		}
 		volSizeMB := int64(common.RoundUpSize(volSizeBytes, common.MbInBytes))
-
+		volumeSource := req.GetVolumeContentSource()
 		// Get supervisorStorageClass and accessMode
 		var supervisorStorageClass string
 		for param := range req.Parameters {
@@ -302,8 +302,12 @@ func (c *controller) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequ
 					}
 					annotations[common.AnnGuestClusterRequestedTopology] = topologyAnnotation
 				}
+				var volumeSnapshotName string
+				if commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.BlockVolumeSnapshot) {
+					volumeSnapshotName = volumeSource.GetSnapshot().GetSnapshotId()
+				}
 				claim := getPersistentVolumeClaimSpecWithStorageClass(supervisorPVCName, c.supervisorNamespace,
-					diskSize, supervisorStorageClass, getAccessMode(accessMode), annotations)
+					diskSize, supervisorStorageClass, getAccessMode(accessMode), annotations, volumeSnapshotName)
 				log.Debugf("PVC claim spec is %+v", spew.Sdump(claim))
 				pvc, err = c.supervisorClient.CoreV1().PersistentVolumeClaims(c.supervisorNamespace).Create(
 					ctx, claim, metav1.CreateOptions{})
