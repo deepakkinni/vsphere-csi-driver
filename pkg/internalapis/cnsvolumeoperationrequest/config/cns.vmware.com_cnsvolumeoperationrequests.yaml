@@ -128,6 +128,14 @@ spec:
                       invoked on CNS. Valid strings are "In Progress", "Successful"
                       and "Failed".
                     type: string
+                  operationReservation:
+                    anyOf:
+                      - type: integer
+                      - type: string
+                    description: Reservations made for the specific operation
+                      that are being provisioned
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
                 required:
                 - taskId
                 - taskInvocationTimestamp
@@ -167,6 +175,14 @@ spec:
                         task invoked on CNS. Valid strings are "In Progress", "Successful"
                         and "Failed".
                       type: string
+                    operationReservation:
+                      anyOf:
+                        - type: integer
+                        - type: string
+                      description: Reservations made for the specific operation
+                        that are being provisioned
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
                   required:
                   - taskId
                   - taskInvocationTimestamp

@@ -69,6 +69,7 @@ type OperationDetails struct {
 	OpID                    string
 	TaskStatus              string
 	Error                   string
+	OperationReservation    *resource.Quantity
 }
 
 // CreateVolumeOperationRequestDetails returns an object of type
@@ -89,6 +90,7 @@ func CreateVolumeOperationRequestDetails(name, volumeID, snapshotID string, capa
 			OpID:                    opID,
 			TaskStatus:              taskStatus,
 			Error:                   error,
+			OperationReservation:    quotaDetails.Reserved,
 		},
 	}
 }
@@ -105,5 +107,6 @@ func convertToCnsVolumeOperationRequestDetails(
 		OpID:                    details.OpID,
 		TaskStatus:              details.TaskStatus,
 		Error:                   details.Error,
+		OperationReservation:    details.OperationReservation,
 	}
 }

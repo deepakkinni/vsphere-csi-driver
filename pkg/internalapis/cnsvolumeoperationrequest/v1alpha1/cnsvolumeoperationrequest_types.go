@@ -89,6 +89,10 @@ type OperationDetails struct {
 	// Error represents the error returned if the task fails on CNS.
 	// Defaults to empty string.
 	Error string `json:"error,omitempty"`
+	// OperationReservation stores the reservation for this operation. It's useful to
+	// track reservations when successive operations are made on the same volume, for example,
+	// successive expands
+	OperationReservation *resource.Quantity `json:"operationReservation,omitempty"`
 }
 
 //+kubebuilder:object:root=true
