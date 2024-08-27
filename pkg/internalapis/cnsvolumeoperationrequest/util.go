@@ -77,7 +77,8 @@ type OperationDetails struct {
 func CreateVolumeOperationRequestDetails(name, volumeID, snapshotID string, capacity int64,
 	quotaDetails *QuotaDetails, taskInvocationTimestamp metav1.Time, taskID, vCenterServer, opID,
 	taskStatus, error string) *VolumeOperationRequestDetails {
-	return &VolumeOperationRequestDetails{
+	var volumeOperationRequestDetails *VolumeOperationRequestDetails
+	volumeOperationRequestDetails = &VolumeOperationRequestDetails{
 		Name:         name,
 		VolumeID:     volumeID,
 		SnapshotID:   snapshotID,
@@ -90,9 +91,12 @@ func CreateVolumeOperationRequestDetails(name, volumeID, snapshotID string, capa
 			OpID:                    opID,
 			TaskStatus:              taskStatus,
 			Error:                   error,
-			OperationReservation:    quotaDetails.Reserved,
 		},
 	}
+	if quotaDetails != nil {
+		volumeOperationRequestDetails.OperationDetails.OperationReservation = quotaDetails.Reserved
+	}
+	return volumeOperationRequestDetails
 }
 
 // convertToCnsVolumeOperationRequestDetails converts an object of type
