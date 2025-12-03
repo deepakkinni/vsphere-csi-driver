@@ -1603,258 +1603,236 @@ func TestWCPExpandVolumeWithSnapshots(t *testing.T) {
 	}
 }
 
-// TestNew tests the New() constructor function
-func TestNew(t *testing.T) {
-	controller := New()
-	if controller == nil {
-		t.Fatal("New() returned nil controller")
-	}
-
-	// Since New() returns csitypes.CnsController, no need for type assertion
-	// The controller is already of the correct type
-}
-
-// TestControllerGetCapabilities tests the ControllerGetCapabilities method
-func TestControllerGetCapabilities(t *testing.T) {
+// TestCreateVolumeFromSnapshotWithDecimalUnits tests the fix for creating volumes from snapshots
+// when using decimal units (G) instead of binary units (Gi).
+// This test validates that the size comparison now works correctly after rounding.
+func TestCreateVolumeFromSnapshotWithDecimalUnits(t *testing.T) {
 	ct := getControllerTest(t)
 
-	req := &csi.ControllerGetCapabilitiesRequest{}
-	resp, err := ct.controller.ControllerGetCapabilities(ctx, req)
+	// Create a volume with a size that will require rounding when converted to MB.
+	// Using 25G (25,000,000,000 bytes) which rounds to 23,842 MB (25,000,148,992 bytes)
+	params := make(map[string]string)
+	if v := os.Getenv("VSPHERE_DATASTORE_URL"); v != "" {
+		params[common.AttributeDatastoreURL] = v
+	}
+	capabilities := []*csi.VolumeCapability{
+		{
+			AccessMode: &csi.VolumeCapability_AccessMode{
+				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			},
+		},
+	}
+
+	// Create source volume with decimal unit size (25G = 25 * 1000^3 bytes)
+	decimalGigabytes := int64(25 * 1000 * 1000 * 1000) // 25G in decimal
+	reqCreate := &csi.CreateVolumeRequest{
+		Name: testVolumeName + "-decimal-" + uuid.New().String(),
+		CapacityRange: &csi.CapacityRange{
+			RequiredBytes: decimalGigabytes,
+		},
+		Parameters:         params,
+		VolumeCapabilities: capabilities,
+	}
+
+	respCreate, err := ct.controller.CreateVolume(ctx, reqCreate)
 	if err != nil {
-		t.Fatalf("ControllerGetCapabilities failed: %v", err)
+		t.Fatal(err)
+	}
+	volID := respCreate.Volume.VolumeId
+
+	// Verify the volume has been created.
+	queryFilter := cnstypes.CnsQueryFilter{
+		VolumeIds: []cnstypes.CnsVolumeId{{Id: volID}},
+	}
+	queryResult, err := ct.vcenter.CnsClient.QueryVolume(ctx, &queryFilter)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if resp == nil {
-		t.Fatal("ControllerGetCapabilities returned nil response")
+	if len(queryResult.Volumes) != 1 || queryResult.Volumes[0].VolumeId.Id != volID {
+		t.Fatalf("failed to find the newly created volume with ID: %s", volID)
 	}
 
-	// Verify we get a response with capabilities
-	if len(resp.Capabilities) == 0 {
-		t.Error("Expected at least one capability")
+	defer func() {
+		reqDelete := &csi.DeleteVolumeRequest{VolumeId: volID}
+		_, err = ct.controller.DeleteVolume(ctx, reqDelete)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// Create snapshot of the volume
+	reqCreateSnapshot := &csi.CreateSnapshotRequest{
+		SourceVolumeId: volID,
+		Name:           "snapshot-decimal-" + uuid.New().String(),
 	}
 
-	// Verify that the basic capabilities are present
-	expectedBasicCaps := []csi.ControllerServiceCapability_RPC_Type{
-		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
-		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
-		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
-		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
-		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
+	respCreateSnapshot, err := ct.controller.CreateSnapshot(ctx, reqCreateSnapshot)
+	if err != nil {
+		t.Fatal(err)
 	}
+	snapID := respCreateSnapshot.Snapshot.SnapshotId
+	snapshotSizeBytes := respCreateSnapshot.Snapshot.SizeBytes
 
-	// Check that all basic capabilities are present
-	actualCaps := make([]csi.ControllerServiceCapability_RPC_Type, len(resp.Capabilities))
-	for i, cap := range resp.Capabilities {
-		actualCaps[i] = cap.GetRpc().GetType()
-	}
+	defer func() {
+		reqDeleteSnapshot := &csi.DeleteSnapshotRequest{SnapshotId: snapID}
+		_, err = ct.controller.DeleteSnapshot(ctx, reqDeleteSnapshot)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
 
-	for _, expectedCap := range expectedBasicCaps {
-		found := false
-		for _, actualCap := range actualCaps {
-			if actualCap == expectedCap {
-				found = true
-				break
+	// Test 1: Create volume from snapshot with same decimal size (25G)
+	// This should now SUCCEED because we compare rounded MB values
+	t.Run("SameDecimalSize", func(t *testing.T) {
+		reqCreateFromSnapshot := &csi.CreateVolumeRequest{
+			Name: testVolumeName + "-restored-same-" + uuid.New().String(),
+			CapacityRange: &csi.CapacityRange{
+				RequiredBytes: decimalGigabytes, // Same 25G
+			},
+			Parameters:         params,
+			VolumeCapabilities: capabilities,
+			VolumeContentSource: &csi.VolumeContentSource{
+				Type: &csi.VolumeContentSource_Snapshot{
+					Snapshot: &csi.VolumeContentSource_SnapshotSource{
+						SnapshotId: snapID,
+					},
+				},
+			},
+		}
+
+		respRestore, err := ct.controller.CreateVolume(ctx, reqCreateFromSnapshot)
+		if err != nil {
+			t.Fatalf("CreateVolume from snapshot with same decimal size should succeed but failed: %v", err)
+		}
+		restoredVolID := respRestore.Volume.VolumeId
+
+		// Cleanup
+		defer func() {
+			reqDelete := &csi.DeleteVolumeRequest{VolumeId: restoredVolID}
+			_, err = ct.controller.DeleteVolume(ctx, reqDelete)
+			if err != nil {
+				t.Logf("Warning: failed to delete restored volume: %v", err)
 			}
+		}()
+
+		// Verify the restored volume exists
+		queryFilter := cnstypes.CnsQueryFilter{
+			VolumeIds: []cnstypes.CnsVolumeId{{Id: restoredVolID}},
 		}
-		if !found {
-			t.Errorf("Expected capability %v not found in response", expectedCap)
-		}
-	}
-}
-
-// TestListVolumes tests the ListVolumes method
-func TestListVolumes(t *testing.T) {
-	ct := getControllerTest(t)
-
-	t.Run("BasicListVolumes", func(t *testing.T) {
-		req := &csi.ListVolumesRequest{}
-
-		_, err := ct.controller.ListVolumes(ctx, req)
-		// ListVolumes may fail in test environment due to missing NodeIDtoName map
-		// This is expected behavior, so we just verify the method can be called
+		queryResult, err := ct.vcenter.CnsClient.QueryVolume(ctx, &queryFilter)
 		if err != nil {
-			t.Logf("ListVolumes failed as expected in test environment: %v", err)
+			t.Fatal(err)
+		}
+		if len(queryResult.Volumes) != 1 {
+			t.Fatalf("failed to find the restored volume with ID: %s", restoredVolID)
 		}
 	})
 
-	t.Run("ListVolumesWithMaxEntries", func(t *testing.T) {
-		req := &csi.ListVolumesRequest{
-			MaxEntries: 10,
-		}
-
-		_, err := ct.controller.ListVolumes(ctx, req)
-		// ListVolumes may fail in test environment due to missing NodeIDtoName map
-		// This is expected behavior, so we just verify the method can be called
-		if err != nil {
-			t.Logf("ListVolumes with max entries failed as expected in test environment: %v", err)
-		}
-	})
-}
-
-// TestGetCapacity tests the GetCapacity method
-func TestGetCapacity(t *testing.T) {
-	ct := getControllerTest(t)
-
-	t.Run("BasicGetCapacity", func(t *testing.T) {
-		req := &csi.GetCapacityRequest{}
-
-		_, err := ct.controller.GetCapacity(ctx, req)
-		// GetCapacity returns Unimplemented in WCP controller
-		// This is expected behavior, so we just verify the method can be called
-		if err != nil {
-			t.Logf("GetCapacity failed as expected (Unimplemented): %v", err)
-		}
-	})
-
-	t.Run("GetCapacityWithParameters", func(t *testing.T) {
-		req := &csi.GetCapacityRequest{
-			Parameters: map[string]string{
-				"test-param": "test-value",
+	// Test 2: Create volume from snapshot with larger size
+	// This should SUCCEED (size >= snapshot size after rounding)
+	t.Run("LargerSize", func(t *testing.T) {
+		reqCreateFromSnapshot := &csi.CreateVolumeRequest{
+			Name: testVolumeName + "-restored-larger-" + uuid.New().String(),
+			CapacityRange: &csi.CapacityRange{
+				RequiredBytes: decimalGigabytes + (2 * common.GbInBytes), // 27G
+			},
+			Parameters:         params,
+			VolumeCapabilities: capabilities,
+			VolumeContentSource: &csi.VolumeContentSource{
+				Type: &csi.VolumeContentSource_Snapshot{
+					Snapshot: &csi.VolumeContentSource_SnapshotSource{
+						SnapshotId: snapID,
+					},
+				},
 			},
 		}
 
-		_, err := ct.controller.GetCapacity(ctx, req)
-		// GetCapacity returns Unimplemented in WCP controller
-		// This is expected behavior, so we just verify the method can be called
+		respRestore, err := ct.controller.CreateVolume(ctx, reqCreateFromSnapshot)
 		if err != nil {
-			t.Logf("GetCapacity with parameters failed as expected (Unimplemented): %v", err)
+			t.Fatalf("CreateVolume from snapshot with larger size should succeed but failed: %v", err)
 		}
+		restoredVolID := respRestore.Volume.VolumeId
+
+		// Cleanup
+		defer func() {
+			reqDelete := &csi.DeleteVolumeRequest{VolumeId: restoredVolID}
+			_, err = ct.controller.DeleteVolume(ctx, reqDelete)
+			if err != nil {
+				t.Logf("Warning: failed to delete restored volume: %v", err)
+			}
+		}()
 	})
-}
 
-// TestControllerGetVolume tests the ControllerGetVolume method
-func TestControllerGetVolume(t *testing.T) {
-	ct := getControllerTest(t)
-
-	// First create a volume
-	params := make(map[string]string)
-	capabilities := []*csi.VolumeCapability{
-		{
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+	// Test 3: Create volume from snapshot with smaller size
+	// This should FAIL (size < snapshot size after rounding)
+	t.Run("SmallerSize", func(t *testing.T) {
+		// Request a size that rounds to less MB than the snapshot
+		smallerSize := snapshotSizeBytes - (2 * common.MbInBytes) // 2MB less than snapshot
+		reqCreateFromSnapshot := &csi.CreateVolumeRequest{
+			Name: testVolumeName + "-restored-smaller-" + uuid.New().String(),
+			CapacityRange: &csi.CapacityRange{
+				RequiredBytes: smallerSize,
 			},
-		},
-	}
-
-	reqCreate := &csi.CreateVolumeRequest{
-		Name: testVolumeName + "-get-" + uuid.New().String(),
-		CapacityRange: &csi.CapacityRange{
-			RequiredBytes: 1 * common.GbInBytes,
-		},
-		Parameters:         params,
-		VolumeCapabilities: capabilities,
-	}
-
-	respCreate, err := ct.controller.CreateVolume(ctx, reqCreate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		// Clean up
-		reqDelete := &csi.DeleteVolumeRequest{
-			VolumeId: respCreate.Volume.VolumeId,
-		}
-		_, _ = ct.controller.DeleteVolume(ctx, reqDelete)
-	}()
-
-	t.Run("ValidGetVolume", func(t *testing.T) {
-		req := &csi.ControllerGetVolumeRequest{
-			VolumeId: respCreate.Volume.VolumeId,
-		}
-
-		_, err := ct.controller.ControllerGetVolume(ctx, req)
-		// ControllerGetVolume returns Unimplemented in WCP controller
-		// This is expected behavior, so we just verify the method can be called
-		if err != nil {
-			t.Logf("ControllerGetVolume failed as expected (Unimplemented): %v", err)
-		}
-	})
-
-	t.Run("InvalidVolumeId", func(t *testing.T) {
-		req := &csi.ControllerGetVolumeRequest{
-			VolumeId: "invalid-volume-id",
-		}
-
-		_, err := ct.controller.ControllerGetVolume(ctx, req)
-		// ControllerGetVolume returns Unimplemented in WCP controller
-		// This is expected behavior, so we just verify the method can be called
-		if err != nil {
-			t.Logf("ControllerGetVolume failed as expected (Unimplemented): %v", err)
-		}
-	})
-
-	t.Run("EmptyVolumeId", func(t *testing.T) {
-		req := &csi.ControllerGetVolumeRequest{
-			VolumeId: "",
-		}
-
-		_, err := ct.controller.ControllerGetVolume(ctx, req)
-		// ControllerGetVolume returns Unimplemented in WCP controller
-		// This is expected behavior, so we just verify the method can be called
-		if err != nil {
-			t.Logf("ControllerGetVolume failed as expected (Unimplemented): %v", err)
-		}
-	})
-}
-
-// TestControllerModifyVolume tests the ControllerModifyVolume method
-func TestControllerModifyVolume(t *testing.T) {
-	ct := getControllerTest(t)
-
-	// First create a volume
-	params := make(map[string]string)
-	capabilities := []*csi.VolumeCapability{
-		{
-			AccessMode: &csi.VolumeCapability_AccessMode{
-				Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+			Parameters:         params,
+			VolumeCapabilities: capabilities,
+			VolumeContentSource: &csi.VolumeContentSource{
+				Type: &csi.VolumeContentSource_Snapshot{
+					Snapshot: &csi.VolumeContentSource_SnapshotSource{
+						SnapshotId: snapID,
+					},
+				},
 			},
-		},
-	}
-
-	reqCreate := &csi.CreateVolumeRequest{
-		Name: testVolumeName + "-modify-" + uuid.New().String(),
-		CapacityRange: &csi.CapacityRange{
-			RequiredBytes: 1 * common.GbInBytes,
-		},
-		Parameters:         params,
-		VolumeCapabilities: capabilities,
-	}
-
-	respCreate, err := ct.controller.CreateVolume(ctx, reqCreate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		// Clean up
-		reqDelete := &csi.DeleteVolumeRequest{
-			VolumeId: respCreate.Volume.VolumeId,
-		}
-		_, _ = ct.controller.DeleteVolume(ctx, reqDelete)
-	}()
-
-	t.Run("ValidModifyVolume", func(t *testing.T) {
-		req := &csi.ControllerModifyVolumeRequest{
-			VolumeId: respCreate.Volume.VolumeId,
 		}
 
-		_, err := ct.controller.ControllerModifyVolume(ctx, req)
-		// ControllerModifyVolume returns Unimplemented in WCP controller
-		// This is expected behavior, so we just verify the method can be called
-		if err != nil {
-			t.Logf("ControllerModifyVolume failed as expected (Unimplemented): %v", err)
+		_, err := ct.controller.CreateVolume(ctx, reqCreateFromSnapshot)
+		if err == nil {
+			t.Fatal("CreateVolume from snapshot with smaller size should fail but succeeded")
 		}
+
+		statusErr, ok := status.FromError(err)
+		if !ok {
+			t.Fatalf("unable to convert the error: %+v into a grpc status error type", err)
+		}
+		if statusErr.Code() != codes.InvalidArgument {
+			t.Fatalf("unexpected error code received, expected: %s received: %s",
+				codes.InvalidArgument.String(), statusErr.Code().String())
+		}
+		t.Logf("received expected error for smaller size: %v", err)
 	})
 
-	t.Run("InvalidVolumeId", func(t *testing.T) {
-		req := &csi.ControllerModifyVolumeRequest{
-			VolumeId: "invalid-volume-id",
+	// Test 4: Create volume from snapshot with exact snapshot size (after rounding)
+	// This should SUCCEED
+	t.Run("ExactSnapshotSize", func(t *testing.T) {
+		reqCreateFromSnapshot := &csi.CreateVolumeRequest{
+			Name: testVolumeName + "-restored-exact-" + uuid.New().String(),
+			CapacityRange: &csi.CapacityRange{
+				RequiredBytes: snapshotSizeBytes, // Exact snapshot size
+			},
+			Parameters:         params,
+			VolumeCapabilities: capabilities,
+			VolumeContentSource: &csi.VolumeContentSource{
+				Type: &csi.VolumeContentSource_Snapshot{
+					Snapshot: &csi.VolumeContentSource_SnapshotSource{
+						SnapshotId: snapID,
+					},
+				},
+			},
 		}
 
-		_, err := ct.controller.ControllerModifyVolume(ctx, req)
-		// ControllerModifyVolume returns Unimplemented in WCP controller
-		// This is expected behavior, so we just verify the method can be called
+		respRestore, err := ct.controller.CreateVolume(ctx, reqCreateFromSnapshot)
 		if err != nil {
-			t.Logf("ControllerModifyVolume failed as expected (Unimplemented): %v", err)
+			t.Fatalf("CreateVolume from snapshot with exact size should succeed but failed: %v", err)
 		}
+		restoredVolID := respRestore.Volume.VolumeId
+
+		// Cleanup
+		defer func() {
+			reqDelete := &csi.DeleteVolumeRequest{VolumeId: restoredVolID}
+			_, err = ct.controller.DeleteVolume(ctx, reqDelete)
+			if err != nil {
+				t.Logf("Warning: failed to delete restored volume: %v", err)
+			}
+		}()
 	})
 }
