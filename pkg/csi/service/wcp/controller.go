@@ -266,7 +266,6 @@ func (c *controller) Init(config *cnsconfig.Config, version string) error {
 	}
 
 	go cnsvolume.ClearTaskInfoObjects()
-	go cnsvolume.ClearInvalidTasksFromListView(false)
 	cfgPath := cnsconfig.GetConfigPath(ctx)
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {

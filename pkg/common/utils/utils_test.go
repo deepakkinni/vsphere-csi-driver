@@ -9,7 +9,6 @@ import (
 	"os"
 	"sync"
 	"testing"
-	"time"
 
 	vmoperatortypes "github.com/vmware-tanzu/vm-operator/api/v1alpha2"
 	cnssim "github.com/vmware/govmomi/cns/simulator"
@@ -19,7 +18,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	cnsvolumes "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/volume"
@@ -142,15 +140,6 @@ func getCommonUtilsTest(t *testing.T) *commonUtilsTest {
 		volumeManager, err := cnsvolumes.GetManager(ctx, virtualCenter, nil, false, false, false, "", "", "")
 		if err != nil {
 			t.Fatalf("failed to create an instance of volume manager. err=%v", err)
-		}
-
-		// wait till property collector has been started
-		err = wait.PollUntilContextTimeout(ctx, 1*time.Second, 10*time.Second, false,
-			func(ctx context.Context) (done bool, err error) {
-				return volumeManager.IsListViewReady(), nil
-			})
-		if err != nil {
-			t.Fatalf("listview not ready. err=%v", err)
 		}
 
 		commonUtilsTestInstance = &commonUtilsTest{

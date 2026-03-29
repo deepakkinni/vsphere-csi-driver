@@ -171,16 +171,6 @@ func (m MockManager) GetOperationStore() cnsvolumeoperationrequest.VolumeOperati
 	panic("implement me")
 }
 
-func (m MockManager) IsListViewReady() bool {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (m MockManager) SetListViewNotReady(ctx context.Context) {
-	//TODO implement me
-	panic("implement me")
-}
-
 func (m MockManager) BatchAttachVolumes(ctx context.Context, vm *cnsvsphere.VirtualMachine,
 	batchAttachRequest []BatchAttachRequest) ([]BatchAttachResult, string, error) {
 	//TODO implement me

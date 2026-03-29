@@ -190,15 +190,6 @@ func (m *mockVolumeManager) GetOperationStore() cnsvolumeoperationrequest.Volume
 	panic("implement me")
 }
 
-func (m *mockVolumeManager) IsListViewReady() bool {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (m *mockVolumeManager) SetListViewNotReady(ctx context.Context) {
-
-}
-
 func (m *mockVolumeManager) BatchAttachVolumes(ctx context.Context,
 	vm *cnsvsphere.VirtualMachine,
 	volumeIDs []cnsvolume.BatchAttachRequest) ([]cnsvolume.BatchAttachResult, string, error) {

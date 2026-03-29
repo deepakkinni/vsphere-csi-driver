@@ -108,10 +108,6 @@ func (m *mockVolumeManager) QuerySnapshots(ctx context.Context,
 	snapshotQueryFilter cnstypes.CnsSnapshotQueryFilter) (*cnstypes.CnsSnapshotQueryResult, error) {
 	return nil, nil
 }
-func (m *mockVolumeManager) IsListViewReady() bool {
-	return true
-}
-func (m *mockVolumeManager) SetListViewNotReady(ctx context.Context) {}
 func (m *mockVolumeManager) GetOperationStore() cnsvolumeoperationrequest.VolumeOperationRequest {
 	return nil
 }

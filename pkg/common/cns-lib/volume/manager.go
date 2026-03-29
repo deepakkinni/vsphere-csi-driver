@@ -47,14 +47,8 @@ const (
 	// expired create volume tasks.
 	// TODO: This timeout will be configurable in future releases.
 	defaultTaskCleanupIntervalInMinutes = 1
-	// defaultListViewCleanupInvalidTasksInMinutes is the interval for removing tasks from the listview
-	// and internal map that couldn't be removed due to any vc issues
-	defaultListViewCleanupInvalidTasksInMinutes = 15
-
 	// VolumeOperationTimeoutInSeconds specifies the default CSI operation timeout in seconds
 	VolumeOperationTimeoutInSeconds = 300
-
-	listviewAdditionError = "failed to add task to list view"
 
 	// defaultOpsExpirationTimeInHours is expiration time for create volume operations.
 	// TODO: This timeout will be configurable in future releases
@@ -147,11 +141,6 @@ type Manager interface {
 		string, error)
 	// GetOperationStore returns the VolumeOperationRequest interface
 	GetOperationStore() cnsvolumeoperationrequest.VolumeOperationRequest
-	// IsListViewReady returns the status of the listview + property collector mechanism
-	IsListViewReady() bool
-	// SetListViewNotReady explicitly states the listview state as not ready
-	// use case: unit tests
-	SetListViewNotReady(ctx context.Context)
 	// BatchAttachVolumes attaches multiple volumes to a virtual machine.
 	BatchAttachVolumes(ctx context.Context,
 		vm *cnsvsphere.VirtualMachine, batchAttachRequest []BatchAttachRequest) ([]BatchAttachResult, string, error)
@@ -293,10 +282,6 @@ func GetManager(ctx context.Context, vc *cnsvsphere.VirtualCenter,
 		}
 		managerInstanceMap[vc.Config.Host] = managerInstance
 	}
-	err := managerInstance.initListView(ctx)
-	if err != nil {
-		return nil, err
-	}
 	return managerInstance, nil
 }
 
@@ -306,7 +291,6 @@ type defaultManager struct {
 	operationStore                 cnsvolumeoperationrequest.VolumeOperationRequest
 	idempotencyHandlingEnabled     bool
 	multivCenterTopologyDeployment bool
-	listViewIf                     ListViewIf
 	clusterFlavor                  cnstypes.CnsClusterFlavor
 	clusterId                      string
 	clusterDistribution            string
@@ -360,23 +344,6 @@ func ClearTaskInfoObjects() {
 	}
 }
 
-func ClearInvalidTasksFromListView(multivCenterCSITopologyEnabled bool) {
-	ticker := time.NewTicker(time.Duration(defaultListViewCleanupInvalidTasksInMinutes) * time.Minute)
-	for range ticker.C {
-		if multivCenterCSITopologyEnabled {
-			for _, mgr := range managerInstanceMap {
-				if mgr.listViewIf != nil {
-					RemoveTasksMarkedForDeletion(mgr.listViewIf.(*ListViewImpl))
-				}
-			}
-		} else {
-			if managerInstance.listViewIf != nil {
-				RemoveTasksMarkedForDeletion(managerInstance.listViewIf.(*ListViewImpl))
-			}
-		}
-	}
-}
-
 // ResetManager helps set manager instance with new VC configuration.
 func (m *defaultManager) ResetManager(ctx context.Context, vcenter *cnsvsphere.VirtualCenter) error {
 	log := logger.GetLogger(ctx)
@@ -384,7 +351,6 @@ func (m *defaultManager) ResetManager(ctx context.Context, vcenter *cnsvsphere.V
 	defer managerInstanceLock.Unlock()
 	log.Infof("Re-initializing defaultManager.virtualCenter")
 	managerInstance.virtualCenter = vcenter
-	m.listViewIf.ResetVirtualCenter(ctx, managerInstance.virtualCenter)
 	log.Infof("Done resetting volume.defaultManager")
 	return nil
 }
@@ -811,81 +777,35 @@ func (m *defaultManager) createVolumeWithTransaction(ctx context.Context, spec *
 		spec.Metadata.ContainerClusterArray[0].ClusterId)
 }
 
-// IsTaskPending returns true in two cases -
-// 1. if the task status was in progress
-// 2. if the status was an error but the error was for adding the task to the listview
-// (as we don't know the status of the task on CNS)
+// IsTaskPending returns true when a previous task is still worth retrying:
+// 1. The task status is in-progress and a task ID exists on vCenter.
+// 2. The task errored with a legacy "failed to add task to list view" message
+//    (persisted by older driver versions) — the actual CNS task may still be running.
 func IsTaskPending(volumeOperationDetails *cnsvolumeoperationrequest.VolumeOperationRequestDetails) bool {
 	if volumeOperationDetails.OperationDetails.TaskStatus == taskInvocationStatusInProgress &&
 		volumeOperationDetails.OperationDetails.TaskID != "" {
 		return true
 	} else if volumeOperationDetails.OperationDetails.TaskStatus == taskInvocationStatusError &&
-		strings.Contains(volumeOperationDetails.OperationDetails.Error, listviewAdditionError) {
+		strings.Contains(volumeOperationDetails.OperationDetails.Error, "failed to add task to list view") {
 		return true
 	}
 	return false
 }
 
-func (m *defaultManager) waitOnTask(csiOpContext context.Context,
+// waitOnTask uses govmomi's built-in task.WaitForResult to wait for a vCenter task
+// to reach a terminal state. Each call creates a dedicated PropertyCollector that is
+// destroyed when the call returns, making it fully thread-safe for concurrent use.
+// The caller's context controls the timeout; when it expires, the call returns immediately.
+func (m *defaultManager) waitOnTask(ctx context.Context,
 	taskMoRef vim25types.ManagedObjectReference) (*vim25types.TaskInfo, error) {
-	log := logger.GetLogger(csiOpContext)
-	if m.listViewIf == nil {
-		err := m.initListView(context.Background())
-		if err != nil {
-			return nil, err
-		}
-	}
-	ch := make(chan TaskResult, 1)
-	err := m.listViewIf.AddTask(csiOpContext, taskMoRef, ch)
-	if errors.Is(err, ErrListViewTaskAddition) {
-		return nil, logger.LogNewErrorf(log, "%s. err: %v", listviewAdditionError, err)
-	} else if err != nil {
-		// in case the task is not found in VC, we are returning a ManagedObjectNotFound error wrapped as a soap fault
-		// we need to return it as is to ensure that further CNS Volume Operations CR gets updated correctly
+	log := logger.GetLogger(ctx)
+	log.Infof("waitOnTask: waiting for task %v", taskMoRef)
+	t := object.NewTask(m.virtualCenter.Client.Client, taskMoRef)
+	taskInfo, err := t.WaitForResult(ctx)
+	if err != nil {
 		return nil, err
 	}
-
-	// deferring removal of task after response from CNS
-	// called only after successful addition to listView, so we don't need any check for the removal
-	defer func() {
-		err := m.listViewIf.RemoveTask(csiOpContext, taskMoRef)
-		if err != nil {
-			log.Errorf("failed to remove task from list view. err: %v", err)
-			err = m.listViewIf.MarkTaskForDeletion(csiOpContext, taskMoRef)
-			if err != nil {
-				log.Errorf("failed to mark task for deletion. err: %v", err)
-			}
-		}
-	}()
-	return waitForResultOrTimeout(csiOpContext, taskMoRef, ch)
-}
-
-// waitForResultOrTimeout uses the context provided by the sidecars when CSI driver operations are called.
-// This context has a timeout associated with it (see manifests for more details).
-// Once this caller timeout is over, we want to return an error back to the caller
-func waitForResultOrTimeout(csiOpContext context.Context, taskMoRef vim25types.ManagedObjectReference,
-	ch chan TaskResult) (*vim25types.TaskInfo, error) {
-	var taskInfo *vim25types.TaskInfo
-	var err error
-	select {
-	case <-csiOpContext.Done():
-		err = fmt.Errorf("time out for task %v before response from CNS", taskMoRef)
-		taskInfo = nil
-	case result := <-ch:
-		err = result.Err
-		taskInfo = result.TaskInfo
-	}
-	return taskInfo, err
-}
-
-func (m *defaultManager) initListView(ctx context.Context) error {
-	log := logger.GetLogger(ctx)
-	var err error
-	m.listViewIf, err = NewListViewImpl(ctx, m.virtualCenter)
-	if err != nil {
-		return logger.LogNewErrorf(log, "failed to initialize listView object. err: %v", err)
-	}
-	return nil
+	return taskInfo, nil
 }
 
 // createVolume invokes CNS CreateVolume. It stores task information in an
@@ -3989,19 +3909,6 @@ func (m *defaultManager) SyncVolume(ctx context.Context, syncVolumeSpecs []cnsty
 			prometheus.PrometheusPassStatus).Observe(time.Since(start).Seconds())
 	}
 	return faultType, err
-}
-
-func (m *defaultManager) IsListViewReady() bool {
-	if m.listViewIf == nil {
-		return false
-	}
-	return m.listViewIf.IsListViewReady()
-}
-
-func (m *defaultManager) SetListViewNotReady(ctx context.Context) {
-	if m.listViewIf != nil {
-		m.listViewIf.SetListViewNotReady(ctx)
-	}
 }
 
 // UnregisterVolume unregisters a volume from CNS.
