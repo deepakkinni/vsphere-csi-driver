@@ -28,6 +28,7 @@ import (
 	"github.com/vmware/govmomi/cns"
 	cnstypes "github.com/vmware/govmomi/cns/types"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/soap"
 	vim25types "github.com/vmware/govmomi/vim25/types"
 	"github.com/vmware/govmomi/vslm"
@@ -294,6 +295,7 @@ type defaultManager struct {
 	clusterFlavor                  cnstypes.CnsClusterFlavor
 	clusterId                      string
 	clusterDistribution            string
+	taskWatcher                    *TaskWatcher
 }
 
 // ClearTaskInfoObjects is a go routine which runs in the background to clean
@@ -345,12 +347,18 @@ func ClearTaskInfoObjects() {
 }
 
 // ResetManager helps set manager instance with new VC configuration.
+// It also signals the TaskWatcher to tear down its current session and
+// reconnect with the new credentials.
 func (m *defaultManager) ResetManager(ctx context.Context, vcenter *cnsvsphere.VirtualCenter) error {
 	log := logger.GetLogger(ctx)
 	managerInstanceLock.Lock()
 	defer managerInstanceLock.Unlock()
 	log.Infof("Re-initializing defaultManager.virtualCenter")
 	managerInstance.virtualCenter = vcenter
+	if managerInstance.taskWatcher != nil {
+		log.Infof("Signaling TaskWatcher to reconnect with new credentials")
+		managerInstance.taskWatcher.ResetClient()
+	}
 	log.Infof("Done resetting volume.defaultManager")
 	return nil
 }
@@ -792,20 +800,45 @@ func IsTaskPending(volumeOperationDetails *cnsvolumeoperationrequest.VolumeOpera
 	return false
 }
 
-// waitOnTask uses govmomi's built-in task.WaitForResult to wait for a vCenter task
-// to reach a terminal state. Each call creates a dedicated PropertyCollector that is
-// destroyed when the call returns, making it fully thread-safe for concurrent use.
-// The caller's context controls the timeout; when it expires, the call returns immediately.
+// waitOnTask delegates to the TaskWatcher actor which multiplexes all task
+// monitoring through a single PropertyCollector + ListView. If the watcher
+// hasn't been initialised yet (e.g. in unit tests), it falls back to the
+// per-call WaitForResult approach.
 func (m *defaultManager) waitOnTask(ctx context.Context,
 	taskMoRef vim25types.ManagedObjectReference) (*vim25types.TaskInfo, error) {
 	log := logger.GetLogger(ctx)
 	log.Infof("waitOnTask: waiting for task %v", taskMoRef)
+
+	if m.taskWatcher != nil {
+		return m.taskWatcher.WaitForTask(ctx, taskMoRef)
+	}
+
+	// Fallback for unit tests or cases where the watcher is not initialized.
 	t := object.NewTask(m.virtualCenter.Client.Client, taskMoRef)
 	taskInfo, err := t.WaitForResult(ctx)
 	if err != nil {
 		return nil, err
 	}
 	return taskInfo, nil
+}
+
+// initTaskWatcher creates and starts the TaskWatcher for this manager.
+func (m *defaultManager) initTaskWatcher(ctx context.Context) {
+	m.taskWatcher = NewTaskWatcher(ctx, TaskWatcherConfig{
+		ClientFn: func() *vim25.Client {
+			if m.virtualCenter != nil && m.virtualCenter.Client != nil {
+				return m.virtualCenter.Client.Client
+			}
+			return nil
+		},
+		ConnectFn: func(connectCtx context.Context) error {
+			if m.virtualCenter == nil {
+				return fmt.Errorf("virtualCenter is nil")
+			}
+			return m.virtualCenter.Connect(connectCtx)
+		},
+		FatalFn: nil, // Caller can set this externally if desired.
+	})
 }
 
 // createVolume invokes CNS CreateVolume. It stores task information in an
