@@ -239,6 +239,11 @@ func (h *CSISupervisorWebhook) Handle(ctx context.Context, req admission.Request
 			admissionResp := validatePVC(ctx, &req.AdmissionRequest)
 			resp.AdmissionResponse = *admissionResp.DeepCopy()
 		}
+		if resp.Allowed {
+			// Reject PVC deletion when the volume is owned by a VM.
+			admissionResp := validatePVCDeletionForVMOwnedVolumes(ctx, &req.AdmissionRequest)
+			resp.AdmissionResponse = *admissionResp.DeepCopy()
+		}
 	} else if req.Kind.Kind == "CnsFileAccessConfig" {
 		if featureFileVolumesWithVmServiceEnabled {
 			switch req.Operation {
