@@ -42,6 +42,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	apis "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator"
+	csivolumeinfosvc "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	volumes "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/volume"
 	commonconfig "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/config"
 	"sigs.k8s.io/vsphere-csi-driver/v3/pkg/csi/service/common"
@@ -82,6 +84,7 @@ func Add(mgr manager.Manager, clusterFlavor cnstypes.CnsClusterFlavor,
 	var coCommonInterface commonco.COCommonInterface
 	var err error
 	var volumeInfoService cnsvolumeinfo.VolumeInfoService
+	var csiVolumeInfoSvc csivolumeinfosvc.CsiVolumeInfoService
 	// VirtualMachineSnapshot quota validation is only supported on WCP.
 	if clusterFlavor == cnstypes.CnsClusterFlavorWorkload {
 		coCommonInterface, err = commonco.GetContainerOrchestratorInterface(ctx,
@@ -102,6 +105,15 @@ func Add(mgr manager.Manager, clusterFlavor cnstypes.CnsClusterFlavor,
 			return logger.LogNewErrorf(log, "error initializing volumeInfoService. error: %+v", err)
 		}
 		log.Info("Successfully initialized VolumeInfoService")
+		log.Info("Initializing CsiVolumeInfo service for VMManaged snapshot sync filtering")
+		csiVolumeInfoSvc, err = csivolumeinfosvc.InitCsiVolumeInfoService(ctx)
+		if err != nil {
+			log.Warnf("Could not initialize CsiVolumeInfoService; VMManaged volumes will not be "+
+				"filtered from SyncVolume (fail-open). error: %+v", err)
+			csiVolumeInfoSvc = nil
+		} else {
+			log.Info("Successfully initialized CsiVolumeInfoService")
+		}
 	} else {
 		log.Info("Not initializing VirtualMachineSnapshot Controller as guest/vanilla cluster is detected.")
 		return nil
@@ -138,13 +150,14 @@ func Add(mgr manager.Manager, clusterFlavor cnstypes.CnsClusterFlavor,
 	)
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: apis.GroupName})
 	return add(mgr, newReconciler(mgr, configInfo, volumeManager,
-		recorder, vmSnapVMOperatorClient, volumeInfoService))
+		recorder, vmSnapVMOperatorClient, volumeInfoService, csiVolumeInfoSvc))
 }
 
 // newReconciler returns a new reconcile.Reconciler.
 func newReconciler(mgr manager.Manager, configInfo *commonconfig.ConfigurationInfo,
 	volumeManager volumes.Manager, recorder record.EventRecorder, vmSnapVMOperatorClient client.Client,
-	volumeInfoService cnsvolumeinfo.VolumeInfoService) reconcile.Reconciler {
+	volumeInfoService cnsvolumeinfo.VolumeInfoService,
+	csiVolumeInfoService csivolumeinfosvc.CsiVolumeInfoService) reconcile.Reconciler {
 	return &ReconcileVirtualMachineSnapshot{
 		client:                 mgr.GetClient(),
 		scheme:                 mgr.GetScheme(),
@@ -153,6 +166,7 @@ func newReconciler(mgr manager.Manager, configInfo *commonconfig.ConfigurationIn
 		recorder:               recorder,
 		vmSnapVMOperatorClient: vmSnapVMOperatorClient,
 		volumeInfoService:      volumeInfoService,
+		csiVolumeInfoService:   csiVolumeInfoService,
 	}
 }
 
@@ -190,6 +204,11 @@ type ReconcileVirtualMachineSnapshot struct {
 	recorder               record.EventRecorder
 	volumeInfoService      cnsvolumeinfo.VolumeInfoService
 	vmSnapVMOperatorClient client.Client
+	// csiVolumeInfoService is used to check per-volume CsiVolumeInfo ownership.
+	// When a volume's CsiVolumeInfo shows VMManaged ownership, SyncVolume is
+	// skipped: the FCD is unregistered from CNS and the call would return NotFound.
+	// Nil only if service initialization failed at startup (fail-open: skip no volumes).
+	csiVolumeInfoService csivolumeinfosvc.CsiVolumeInfoService
 }
 
 // Reconcile reads that state of the cluster for a VirtualMachineSnapshot object and
@@ -396,6 +415,14 @@ func (r *ReconcileVirtualMachineSnapshot) syncVolumesAndUpdateCNSVolumeInfo(ctx 
 		if vmVolume.VirtualMachineVolumeSource.PersistentVolumeClaim == nil {
 			continue
 		}
+		// IndependentPersistent and IndependentNonPersistent disks are excluded
+		// from VM snapshots by vSphere; NonPersistent data reverts on power-off.
+		// Only Persistent (default) disks have snapshot deltas worth accounting.
+		if vmVolume.DiskMode != "" && vmVolume.DiskMode != vmoperatortypes.VolumeDiskModePersistent {
+			log.Infof("syncVolumesAndUpdateCNSVolumeInfo: skipping volume %s with diskMode %s "+
+				"(not included in VM snapshots)", vmVolume.Name, vmVolume.DiskMode)
+			continue
+		}
 		pvcKey := apitypes.NamespacedName{
 			Namespace: vm.Namespace,
 			Name:      vmVolume.VirtualMachineVolumeSource.PersistentVolumeClaim.ClaimName,
@@ -419,6 +446,24 @@ func (r *ReconcileVirtualMachineSnapshot) syncVolumesAndUpdateCNSVolumeInfo(ctx 
 				return err
 			}
 			if pv.Spec.CSI != nil && pv.Spec.CSI.VolumeHandle != "" {
+				// When VMOwnedVolumes is enabled, skip volumes whose FCD has been
+				// unregistered from CNS (VMManaged). Calling SyncVolume on them
+				// returns NotFound. Snapshot quota for these disks is tracked by
+				// vm-operator via the vmSnapshot path instead.
+				if r.csiVolumeInfoService != nil {
+					cvi, cviErr := r.csiVolumeInfoService.GetCsiVolumeInfo(ctx, pv.Spec.CSI.VolumeHandle)
+					if cviErr != nil {
+						log.Warnf("syncVolumesAndUpdateCNSVolumeInfo: could not get CsiVolumeInfo "+
+							"for volume %s, including in sync (fail-open). error: %v",
+							pv.Spec.CSI.VolumeHandle, cviErr)
+					} else if cvi != nil && cvi.Status.Ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged {
+						log.Infof("syncVolumesAndUpdateCNSVolumeInfo: skipping SyncVolume for "+
+							"VMManaged volume %s (pvc %s/%s)", pv.Spec.CSI.VolumeHandle,
+							vm.Namespace,
+							vmVolume.VirtualMachineVolumeSource.PersistentVolumeClaim.ClaimName)
+						continue
+					}
+				}
 				cnsVolId := cnstypes.CnsVolumeId{Id: pv.Spec.CSI.VolumeHandle}
 				cnsVolumeIds = append(cnsVolumeIds, cnsVolId)
 				syncVolumeSpecs := []cnstypes.CnsSyncVolumeSpec{
