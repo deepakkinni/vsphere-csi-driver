@@ -218,7 +218,6 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 //  2. Patch spec.diskPath and spec.diskUUID onto the CVI.
 //  3. Add the volume-protection finalizer so GC is blocked while VM-managed.
 //  4. Patch status: ownership=VMManaged, phase=Succeeded, observedGeneration, Ready=True.
-//  5. Ack the unregister (phase-2 of the two-phase protocol).
 func (r *Reconciler) reconcileUnregister(ctx context.Context,
 	cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
 	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
@@ -275,15 +274,6 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 	}
 	log.Infof("reconcileUnregister: status patched to VMManaged/Succeeded for volume %q",
 		cvi.Spec.VolumeID)
-
-	// Phase-2: acknowledge the unregister.  This must happen after all durable
-	// state has been written so the controller can recover on restart.
-	log.Infof("reconcileUnregister: calling AckUnregister for volume %q", cvi.Spec.VolumeID)
-	if err := r.volumeManager.AckUnregister(ctx, cvi.Spec.VolumeID); err != nil {
-		return fmt.Errorf("reconcileUnregister: AckUnregister failed for %q: %w",
-			cvi.Spec.VolumeID, err)
-	}
-	log.Infof("reconcileUnregister: AckUnregister completed for volume %q", cvi.Spec.VolumeID)
 	return nil
 }
 

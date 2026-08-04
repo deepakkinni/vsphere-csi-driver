@@ -132,11 +132,10 @@ func (g *genBumpingCviService) PatchCsiVolumeInfo(
 // ---------------------------------------------------------------------------
 
 // testVolumeManager is a test-scoped implementation of volumes.Manager that
-// lets each test control the behaviour of UnregisterVolumeEx, AckUnregister,
-// and CreateVolume independently.
+// lets each test control the behaviour of UnregisterVolumeEx and CreateVolume
+// independently.
 type testVolumeManager struct {
 	unregisterVolumeExFn func(ctx context.Context, volumeID string) (string, string, error)
-	ackUnregisterFn      func(ctx context.Context, volumeID string) error
 	createVolumeFn       func(ctx context.Context, spec *cnstypes.CnsVolumeCreateSpec,
 		extraParams interface{}) (*cnsvolumes.CnsVolumeInfo, string, error)
 }
@@ -146,13 +145,6 @@ func (m *testVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID str
 		return m.unregisterVolumeExFn(ctx, volumeID)
 	}
 	return "test-disk-path", "test-disk-uuid", nil
-}
-
-func (m *testVolumeManager) AckUnregister(ctx context.Context, volumeID string) error {
-	if m.ackUnregisterFn != nil {
-		return m.ackUnregisterFn(ctx, volumeID)
-	}
-	return nil
 }
 
 func (m *testVolumeManager) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
@@ -286,10 +278,6 @@ func (m *testVolumeManager) QueryFCDChangedBlocks(ctx context.Context,
 	volumeID, targetSnapshotID, baseChangeID string, startingOffset uint64) (
 	[]cnsvolumes.DiskArea, uint64, error) {
 	panic("not implemented")
-}
-func (m *testVolumeManager) QueryPendingUnregisters(ctx context.Context) (
-	[]cnsvolumes.PendingUnregisterRecord, error) {
-	return nil, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -444,7 +432,7 @@ func TestReconcile_GetError(t *testing.T) {
 // TestReconcile_UnregisterTransition verifies the full unregister path:
 // spec.vms=[vmA], ownership="" → UnregisterVolumeEx called, spec.diskPath/diskUUID
 // patched, protection finalizer added, status.ownership=VMManaged, phase=Succeeded,
-// observedGeneration matches, AckUnregister called.
+// observedGeneration matches.
 func TestReconcile_UnregisterTransition(t *testing.T) {
 	const volID = "vol-unregister"
 	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
@@ -453,16 +441,10 @@ func TestReconcile_UnregisterTransition(t *testing.T) {
 	s := newScheme(t)
 	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
 
-	ackCalled := false
 	mgr := &testVolumeManager{
 		unregisterVolumeExFn: func(_ context.Context, id string) (string, string, error) {
 			assert.Equal(t, volID, id)
 			return "/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", nil
-		},
-		ackUnregisterFn: func(_ context.Context, id string) error {
-			assert.Equal(t, volID, id)
-			ackCalled = true
-			return nil
 		},
 	}
 
@@ -478,7 +460,6 @@ func TestReconcile_UnregisterTransition(t *testing.T) {
 	res, err := r.Reconcile(context.Background(), makeRequest(volID))
 	require.NoError(t, err)
 	assert.True(t, res.IsZero())
-	assert.True(t, ackCalled, "AckUnregister must be called")
 
 	// Read updated CVI from fake store.
 	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}

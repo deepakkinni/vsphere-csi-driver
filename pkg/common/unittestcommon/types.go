@@ -251,19 +251,9 @@ func (m *MockVolumeManager) ReRegisterVolume(ctx context.Context, volumeID strin
 	return nil
 }
 
-// UnregisterVolumeEx is a stub implementation of the phase-1 two-phase unregister.
+// UnregisterVolumeEx is a stub implementation of the CNS unregister call.
 func (m *MockVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, error) {
 	return "", "", nil
-}
-
-// QueryPendingUnregisters is a stub implementation returning an empty list.
-func (m *MockVolumeManager) QueryPendingUnregisters(ctx context.Context) ([]cnsvolume.PendingUnregisterRecord, error) {
-	return nil, nil
-}
-
-// AckUnregister is a stub implementation of the phase-2 two-phase unregister.
-func (m *MockVolumeManager) AckUnregister(ctx context.Context, volumeID string) error {
-	return nil
 }
 
 // GetDiskFolderURL is a stub implementation.

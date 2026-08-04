@@ -983,16 +983,6 @@ func (m *mockVolumeManagerForFullSync) UnregisterVolumeEx(
 	return "", "", nil
 }
 
-func (m *mockVolumeManagerForFullSync) QueryPendingUnregisters(
-	ctx context.Context,
-) ([]volumes.PendingUnregisterRecord, error) {
-	return nil, nil
-}
-
-func (m *mockVolumeManagerForFullSync) AckUnregister(ctx context.Context, volumeID string) error {
-	return nil
-}
-
 func (m *mockVolumeManagerForFullSync) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
 	return "", nil
 }

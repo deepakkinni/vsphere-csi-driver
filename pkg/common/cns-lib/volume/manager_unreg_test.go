@@ -57,52 +57,6 @@ func TestMockUnregisterVolumeExFailure(t *testing.T) {
 	assert.Equal(t, sentinelErr, err)
 }
 
-// TestMockQueryPendingUnregistersSuccess verifies the success path.
-func TestMockQueryPendingUnregistersSuccess(t *testing.T) {
-	ctx := context.Background()
-	m := NewMockManager(false, nil, "")
-
-	results, err := m.QueryPendingUnregisters(ctx)
-
-	require.NoError(t, err)
-	assert.Nil(t, results)
-}
-
-// TestMockQueryPendingUnregistersFailure verifies the error path.
-func TestMockQueryPendingUnregistersFailure(t *testing.T) {
-	ctx := context.Background()
-	sentinelErr := errors.New("cns query pending unregisters failed")
-	m := NewMockManager(true, sentinelErr, "vim25:SystemError")
-
-	results, err := m.QueryPendingUnregisters(ctx)
-
-	require.Error(t, err)
-	assert.Equal(t, sentinelErr, err)
-	assert.Nil(t, results)
-}
-
-// TestMockAckUnregisterSuccess verifies the success path.
-func TestMockAckUnregisterSuccess(t *testing.T) {
-	ctx := context.Background()
-	m := NewMockManager(false, nil, "")
-
-	err := m.AckUnregister(ctx, "test-volume-id")
-
-	require.NoError(t, err)
-}
-
-// TestMockAckUnregisterFailure verifies the error path.
-func TestMockAckUnregisterFailure(t *testing.T) {
-	ctx := context.Background()
-	sentinelErr := errors.New("cns ack unregister failed")
-	m := NewMockManager(true, sentinelErr, "vim25:SystemError")
-
-	err := m.AckUnregister(ctx, "test-volume-id")
-
-	require.Error(t, err)
-	assert.Equal(t, sentinelErr, err)
-}
-
 // TestDefaultManagerUnregisterVolumeExNilVC verifies that UnregisterVolumeEx
 // returns an error immediately when the virtualCenter is nil (no live VC
 // required for this unit test path).
@@ -116,34 +70,10 @@ func TestDefaultManagerUnregisterVolumeExNilVC(t *testing.T) {
 	assert.Contains(t, err.Error(), "virtual center connection not established")
 }
 
-// TestDefaultManagerQueryPendingUnregistersNilVC verifies that
-// QueryPendingUnregisters returns an error when the virtualCenter is nil.
-func TestDefaultManagerQueryPendingUnregistersNilVC(t *testing.T) {
-	ctx := context.Background()
-	m := &defaultManager{}
-
-	_, err := m.QueryPendingUnregisters(ctx)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "virtual center connection not established")
-}
-
-// TestDefaultManagerAckUnregisterNilVC verifies that AckUnregister returns
-// an error when the virtualCenter is nil.
-func TestDefaultManagerAckUnregisterNilVC(t *testing.T) {
-	ctx := context.Background()
-	m := &defaultManager{}
-
-	err := m.AckUnregister(ctx, "vol-001")
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "virtual center connection not established")
-}
-
-// TestQueryPendingUnregistersResultType verifies that the CnsUnregisterVolumeResult
+// TestUnregisterVolumeResultType verifies that the CnsUnregisterVolumeResult
 // type has the expected BackingDiskPath and DiskUUID fields (structural regression
 // guard — if the govmomi type changes shape, this test will not compile).
-func TestQueryPendingUnregistersResultType(t *testing.T) {
+func TestUnregisterVolumeResultType(t *testing.T) {
 	r := cnstypes.CnsUnregisterVolumeResult{
 		BackingDiskPath: "/vmfs/volumes/ds1/disk.vmdk",
 		DiskUUID:        "6000c29a-1234-5678-abcd-ef0123456789",

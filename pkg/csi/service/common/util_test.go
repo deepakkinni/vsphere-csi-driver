@@ -959,14 +959,6 @@ func (m *cbtFlagsMockVolumeManager) ReRegisterVolume(context.Context, string) er
 func (m *cbtFlagsMockVolumeManager) UnregisterVolumeEx(context.Context, string) (string, string, error) {
 	return "", "", nil
 }
-func (m *cbtFlagsMockVolumeManager) QueryPendingUnregisters(
-	context.Context) ([]cnsvolume.PendingUnregisterRecord, error) {
-	return nil, nil
-}
-func (m *cbtFlagsMockVolumeManager) AckUnregister(context.Context, string) error {
-	return nil
-}
-
 func (m *cbtFlagsMockVolumeManager) GetDiskFolderURL(context.Context, string) (string, error) {
 	return "", nil
 }
