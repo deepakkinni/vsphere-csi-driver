@@ -73,6 +73,20 @@ spec:
                 items:
                   description: VirtualMachineRef identifies a VM attached to the volume.
                   properties:
+                    diskMode:
+                      description: |-
+                        DiskMode is the disk mode this VM attaches the volume in. CSI keys the
+                        ownership-transfer decision on it: a Persistent (dependent) entry triggers
+                        the best-effort unregister, while an independent entry leaves the FCD
+                        registered and the volume CSIManaged. Written by vm-operator, mirroring
+                        vm.spec.volumes[*].diskMode. An empty value is treated as Persistent,
+                        matching the vm.spec default.
+                      enum:
+                      - Persistent
+                      - IndependentPersistent
+                      - IndependentNonPersistent
+                      - NonPersistent
+                      type: string
                     vmInstanceUUID:
                       description: VMInstanceUUID is the instance UUID of the VM.
                       type: string

@@ -49,7 +49,7 @@ type CsiVolumeInfoService interface {
 	CreateCsiVolumeInfo(ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error
 
 	// GetCsiVolumeInfo fetches a CsiVolumeInfo by deterministic name derived
-	// from volumeID (cns-volume-<volumeID>) in the vmware-system-csi namespace.
+	// from volumeID (cvi-volume-<volumeID>) in the vmware-system-csi namespace.
 	// Returns nil and no error if not found.
 	GetCsiVolumeInfo(ctx context.Context, volumeID string) (*csivolumeinfov1alpha1.CsiVolumeInfo, error)
 
@@ -102,7 +102,7 @@ var (
 )
 
 // GetCsiVolumeInfoCRName returns the deterministic CR name for a volumeID.
-// Name format: cns-volume-<volumeID>.
+// Name format: cvi-volume-<volumeID>.
 func GetCsiVolumeInfoCRName(volumeID string) string {
 	return csivolumeinfov1alpha1.CVINamePrefix + volumeID
 }

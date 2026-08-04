@@ -33,7 +33,14 @@ const (
 	CVINamespace = "vmware-system-csi"
 
 	// CVINamePrefix is prepended to the volumeID to form the CR name.
-	CVINamePrefix = "cns-volume-"
+	CVINamePrefix = "cvi-volume-"
+
+	// FcdRetainedAnnotation marks a VMManaged volume whose FCD was NOT
+	// unregistered because an in-place unregister was blocked. The FCD, its CNS DB
+	// row, and its FCD snapshots all still exist, so lock-down for such a volume
+	// must be enforced by consulting this CR rather than by relying on CNS to
+	// return NotFound.
+	FcdRetainedAnnotation = "csi.vsphere.vmware.com/fcd-retained"
 )
 
 // OwnershipState is the current ownership of the volume.
@@ -65,6 +72,26 @@ const (
 	PhaseFailed PhaseState = "Failed"
 )
 
+// DiskMode is the disk mode a VM attaches a volume in, mirroring vm-operator's
+// VolumeDiskMode.
+// +kubebuilder:validation:Enum=Persistent;IndependentPersistent;IndependentNonPersistent;NonPersistent
+type DiskMode string
+
+const (
+	// DiskModePersistent is the dependent mode: CSI transfers ownership of the
+	// FCD to the VM via a best-effort unregister.
+	DiskModePersistent DiskMode = "Persistent"
+	// DiskModeIndependentPersistent is an independent mode: the FCD stays
+	// registered and CSIManaged.
+	DiskModeIndependentPersistent DiskMode = "IndependentPersistent"
+	// DiskModeIndependentNonPersistent is an independent mode: the FCD stays
+	// registered and CSIManaged.
+	DiskModeIndependentNonPersistent DiskMode = "IndependentNonPersistent"
+	// DiskModeNonPersistent is treated like an independent mode for ownership
+	// purposes: the FCD stays registered and CSIManaged.
+	DiskModeNonPersistent DiskMode = "NonPersistent"
+)
+
 // VirtualMachineRef identifies a VM attached to the volume.
 type VirtualMachineRef struct {
 	// VMName is the VirtualMachine CR name.
@@ -72,6 +99,14 @@ type VirtualMachineRef struct {
 	// VMInstanceUUID is the instance UUID of the VM.
 	// +optional
 	VMInstanceUUID string `json:"vmInstanceUUID,omitempty"`
+	// DiskMode is the disk mode this VM attaches the volume in. CSI keys the
+	// ownership-transfer decision on it: a Persistent (dependent) entry triggers
+	// the best-effort unregister, while an independent entry leaves the FCD
+	// registered and the volume CSIManaged. Written by vm-operator, mirroring
+	// vm.spec.volumes[*].diskMode. An empty value is treated as Persistent,
+	// matching the vm.spec default.
+	// +optional
+	DiskMode DiskMode `json:"diskMode,omitempty"`
 }
 
 // CsiVolumeInfoSpec defines the desired state of CsiVolumeInfo.

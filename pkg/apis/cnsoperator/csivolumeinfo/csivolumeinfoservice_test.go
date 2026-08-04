@@ -59,8 +59,8 @@ func TestGetCsiVolumeInfoCRName(t *testing.T) {
 		volumeID string
 		want     string
 	}{
-		{"abc-123", "cns-volume-abc-123"},
-		{"", "cns-volume-"},
+		{"abc-123", "cvi-volume-abc-123"},
+		{"", "cvi-volume-"},
 	}
 	for _, tc := range cases {
 		got := csivolumeinfo.GetCsiVolumeInfoCRName(tc.volumeID)
@@ -79,9 +79,9 @@ func TestFSSConstantValue(t *testing.T) {
 		t.Errorf("CVINamespace = %q; want %q",
 			csivolumeinfov1alpha1.CVINamespace, "vmware-system-csi")
 	}
-	if csivolumeinfov1alpha1.CVINamePrefix != "cns-volume-" {
+	if csivolumeinfov1alpha1.CVINamePrefix != "cvi-volume-" {
 		t.Errorf("CVINamePrefix = %q; want %q",
-			csivolumeinfov1alpha1.CVINamePrefix, "cns-volume-")
+			csivolumeinfov1alpha1.CVINamePrefix, "cvi-volume-")
 	}
 	_ = wantFSS
 }
