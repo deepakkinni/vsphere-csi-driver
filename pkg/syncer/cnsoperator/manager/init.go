@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	snapv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	vmoperatortypes "github.com/vmware-tanzu/vm-operator/api/v1alpha5"
 	cnstypes "github.com/vmware/govmomi/cns/types"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -100,6 +101,9 @@ func getGlobalScheme(ctx context.Context) *runtime.Scheme {
 		}
 		if err := vmoperatortypes.AddToScheme(globalScheme); err != nil {
 			log.Errorf("failed to add vmoperatortypes to global scheme: %+v", err)
+		}
+		if err := snapv1.AddToScheme(globalScheme); err != nil {
+			log.Errorf("failed to add snapv1 to global scheme: %+v", err)
 		}
 
 		log.Info("Global scheme initialization completed successfully")

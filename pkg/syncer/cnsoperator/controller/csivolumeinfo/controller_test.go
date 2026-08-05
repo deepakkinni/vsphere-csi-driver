@@ -871,11 +871,12 @@ func TestReconcile_IndependentOnlyIsIdleForOwnership(t *testing.T) {
 		"an independent-only volume must stay CSIManaged")
 }
 
-// TestReconcile_FcdRetainedStillAttachedAwaitsConvergence verifies that a
-// fcd-retained volume with a dependent VM still attached is left alone: no
-// unregister re-attempt (that is C8's convergence watch, not this
-// reconciler), and no register (the volume is still attached, not released).
-func TestReconcile_FcdRetainedStillAttachedAwaitsConvergence(t *testing.T) {
+// TestReconcile_FcdRetainedStillInfeasibleSkipsAttempt verifies that when the
+// feasibility query still reports the volume infeasible, attemptConvergence
+// does not bother re-attempting the unregister (a doomed attempt and a task
+// record are worth saving), and never calls CreateVolume either — the volume
+// is still attached, not released.
+func TestReconcile_FcdRetainedStillInfeasibleSkipsAttempt(t *testing.T) {
 	const volID = "vol-fcd-retained-attached"
 	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
 		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
@@ -889,6 +890,10 @@ func TestReconcile_FcdRetainedStillAttachedAwaitsConvergence(t *testing.T) {
 
 	unregisterCalled, createCalled := false, false
 	mgr := &testVolumeManager{
+		queryUnregisterFeasibilityFn: func(_ context.Context,
+			volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			return []cnsvolumes.UnregisterFeasibility{{VolumeID: volID, Feasible: false}}, nil
+		},
 		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
 			unregisterCalled = true
 			return "", "", "", nil
@@ -912,7 +917,7 @@ func TestReconcile_FcdRetainedStillAttachedAwaitsConvergence(t *testing.T) {
 	res, err := r.Reconcile(context.Background(), makeRequest(volID))
 	require.NoError(t, err)
 	assert.True(t, res.IsZero())
-	assert.False(t, unregisterCalled, "a still-attached fcd-retained volume must not re-attempt unregister here")
+	assert.False(t, unregisterCalled, "a still-infeasible volume must not trigger a re-attempt")
 	assert.False(t, createCalled, "a still-attached fcd-retained volume must not be released")
 
 	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
@@ -922,6 +927,111 @@ func TestReconcile_FcdRetainedStillAttachedAwaitsConvergence(t *testing.T) {
 	}, updated))
 	assert.Equal(t, "true", updated.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation],
 		"the fcd-retained annotation must be left untouched")
+}
+
+// TestReconcile_FcdRetainedConvergesWhenFeasible verifies the success path of
+// C8's convergence: when the feasibility query no longer reports a blocker,
+// attemptConvergence re-attempts the unregister, and on success drops
+// fcd-retained and refreshes spec.diskPath without any status transition —
+// ownership was already VMManaged.
+func TestReconcile_FcdRetainedConvergesWhenFeasible(t *testing.T) {
+	const volID = "vol-fcd-retained-converges"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/stale.vmdk", "", 3, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		queryUnregisterFeasibilityFn: func(_ context.Context,
+			volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			return []cnsvolumes.UnregisterFeasibility{{VolumeID: volID, Feasible: true}}, nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, id string) (string, string, string, error) {
+			assert.Equal(t, volID, id)
+			return "/vmfs/volumes/ds/converged.vmdk", "disk-uuid-converged", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.NotContains(t, updated.Annotations, csivolumeinfov1alpha1.FcdRetainedAnnotation)
+	assert.Equal(t, "/vmfs/volumes/ds/converged.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, "disk-uuid-converged", updated.Spec.DiskUUID)
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"no status transition — ownership was already VMManaged")
+}
+
+// TestRecordedBlockerIsLinkedCloneNeverReattempted verifies the terminal
+// short-circuit: a CVI whose Ready condition names LinkedClone is never
+// re-attempted, regardless of what the feasibility query or a forced
+// UnregisterVolumeEx call would report.
+func TestRecordedBlockerIsLinkedCloneNeverReattempted(t *testing.T) {
+	const volID = "vol-linked-clone"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "", 3, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+	cvi.Status.Conditions = []metav1.Condition{{
+		Type:               conditionTypeReady,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonFcdRetained,
+		Message:            "LinkedClone",
+		LastTransitionTime: metav1.Now(),
+	}}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	feasibilityCalled, unregisterCalled := false, false
+	mgr := &testVolumeManager{
+		queryUnregisterFeasibilityFn: func(_ context.Context,
+			volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			feasibilityCalled = true
+			return []cnsvolumes.UnregisterFeasibility{{VolumeID: volID, Feasible: true}}, nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, feasibilityCalled, "a LinkedClone blocker must short-circuit before the feasibility query")
+	assert.False(t, unregisterCalled, "a LinkedClone blocker must never be re-attempted")
 }
 
 // TestReconcile_FcdRetainedReleaseSkipsCreateVolume verifies C7's skip

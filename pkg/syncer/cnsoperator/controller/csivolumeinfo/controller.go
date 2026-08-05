@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	snapv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	cnstypes "github.com/vmware/govmomi/cns/types"
 	vim25types "github.com/vmware/govmomi/vim25/types"
 	corev1 "k8s.io/api/core/v1"
@@ -34,10 +35,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	csivolumeinfosvc "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo"
@@ -90,11 +92,18 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	ctx, log := logger.GetNewContextWithLogger()
 
 	maxWorkerThreads := util.GetMaxWorkerThreads(ctx, workerThreadEnvVar, defaultMaxWorkerThreads)
+	c := mgr.GetClient()
 
 	err := ctrl.NewControllerManagedBy(mgr).
 		Named("csivolumeinfo-controller").
 		For(&csivolumeinfov1alpha1.CsiVolumeInfo{}).
-		WithEventFilter(predicate.GenerationChangedPredicate{}).
+		WithEventFilter(unregisterEligiblePredicate).
+		Watches(&snapv1.VolumeSnapshot{},
+			handler.EnqueueRequestsFromMapFunc(mapVolumeSnapshotDeleteToCVI(c)),
+			builder.WithPredicates(deleteOnlyPredicate)).
+		Watches(&snapv1.VolumeSnapshotContent{},
+			handler.EnqueueRequestsFromMapFunc(mapVolumeSnapshotContentDeleteToCVI(c)),
+			builder.WithPredicates(deleteOnlyPredicate)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: maxWorkerThreads}).
 		Complete(r)
 	if err != nil {
@@ -223,11 +232,28 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 		updateBackoffEntry(ctx, nn, time.Second)
 
 	case vmCount > 0 && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged && fcdRetained:
-		// Still attached, still deferred: this is a re-attempt candidate for
-		// C8's convergence watch, not this reconciler's job. Detach (the
-		// release case below) remains the backstop if it never converges.
-		log.Infof("Reconcile: volume %q is fcd-retained with %d VM(s) still attached; "+
-			"awaiting convergence — no action", cvi.Spec.VolumeID, vmCount)
+		// Still attached, still deferred: woken by a spec change or the
+		// VolumeSnapshot/VolumeSnapshotContent delete watch, re-attempt the
+		// unregister. Detach (the release case below) remains the backstop
+		// if it never converges.
+		log.Infof("Reconcile: volume %q is fcd-retained with %d VM(s) still attached → attemptConvergence",
+			cvi.Spec.VolumeID, vmCount)
+		if err := r.attemptConvergence(ctx, cvi); err != nil {
+			var transientErr *transientUnregisterBlockError
+			if errors.As(err, &transientErr) {
+				log.Infof("Reconcile: convergence re-attempt deferred by a transient blocker for %s; "+
+					"requeueing without a status change: %v", req.Name, err)
+				doubleBackoffDuration(ctx, nn)
+				return reconcile.Result{RequeueAfter: backoff}, nil
+			}
+			log.Errorf("Reconcile: attemptConvergence failed: %v", err)
+			if statusErr := r.setFailedStatus(ctx, cvi, err.Error()); statusErr != nil {
+				log.Warnf("Reconcile: could not write failed status: %v", statusErr)
+			}
+			doubleBackoffDuration(ctx, nn)
+			return reconcile.Result{RequeueAfter: backoff}, nil
+		}
+		updateBackoffEntry(ctx, nn, time.Second)
 
 	case !hasDependent && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged:
 		log.Infof("Reconcile: no dependent VM(s) attached, ownership=VMManaged → reconcileRegister")
