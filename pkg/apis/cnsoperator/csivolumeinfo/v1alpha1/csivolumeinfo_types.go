@@ -129,8 +129,9 @@ type CsiVolumeInfoSpec struct {
 	PVName string `json:"pvName"`
 
 	// DiskUUID is the stable identifier of the virtual disk. Written by CSI after
-	// UnregisterVolumeEx completes and remains set for the lifetime of the VM-managed
-	// phase. Cleared when re-registered as FCD.
+	// UnregisterVolumeEx completes. Not cleared on release back to CSIManaged; the
+	// stale value is harmless and occasionally useful for triage. Unset for an
+	// fcd-retained volume, since the capture that fills it never runs on that path.
 	// +optional
 	DiskUUID string `json:"diskUUID,omitempty"`
 

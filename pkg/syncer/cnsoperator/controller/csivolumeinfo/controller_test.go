@@ -141,6 +141,7 @@ type testVolumeManager struct {
 		volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error)
 	createVolumeFn func(ctx context.Context, spec *cnstypes.CnsVolumeCreateSpec,
 		extraParams interface{}) (*cnsvolumes.CnsVolumeInfo, string, error)
+	getDiskFolderURLFn func(ctx context.Context, datastorePath string) (string, error)
 }
 
 func (m *testVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
@@ -166,6 +167,9 @@ func (m *testVolumeManager) QueryUnregisterFeasibility(ctx context.Context,
 }
 
 func (m *testVolumeManager) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
+	if m.getDiskFolderURLFn != nil {
+		return m.getDiskFolderURLFn(ctx, datastorePath)
+	}
 	return "", nil
 }
 
@@ -818,6 +822,162 @@ func TestReconcile_IdleNoVMs_CSIManaged(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, res.IsZero())
 	assert.False(t, createCalled, "CreateVolume must NOT be called for idle CVI")
+}
+
+// TestReconcile_IndependentOnlyIsIdleForOwnership verifies that a CVI whose
+// spec.vms entries are all independent (no Persistent entry) stays
+// CSIManaged for the life of the attachment: neither UnregisterVolumeEx nor
+// CreateVolume is ever called, because ownership never transfers for an
+// independent-only volume.
+func TestReconcile_IndependentOnlyIsIdleForOwnership(t *testing.T) {
+	const volID = "vol-independent-only"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+		{VMName: "vm-b", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentNonPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled := false
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, unregisterCalled, "UnregisterVolumeEx must NOT be called for an independent-only CVI")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"an independent-only volume must stay CSIManaged")
+}
+
+// TestReconcile_FcdRetainedStillAttachedAwaitsConvergence verifies that a
+// fcd-retained volume with a dependent VM still attached is left alone: no
+// unregister re-attempt (that is C8's convergence watch, not this
+// reconciler), and no register (the volume is still attached, not released).
+func TestReconcile_FcdRetainedStillAttachedAwaitsConvergence(t *testing.T) {
+	const volID = "vol-fcd-retained-attached"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "", 3, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled, createCalled := false, false
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, unregisterCalled, "a still-attached fcd-retained volume must not re-attempt unregister here")
+	assert.False(t, createCalled, "a still-attached fcd-retained volume must not be released")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "true", updated.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation],
+		"the fcd-retained annotation must be left untouched")
+}
+
+// TestReconcile_FcdRetainedReleaseSkipsCreateVolume verifies C7's skip
+// branch: once the last dependent entry leaves spec.vms, a retained FCD is
+// released without ever calling CreateVolume or converting the datastore
+// path to a folder URL, because the FCD was never unregistered in the first
+// place. The annotation is cleared and the volume returns to CSIManaged.
+func TestReconcile_FcdRetainedReleaseSkipsCreateVolume(t *testing.T) {
+	const volID = "vol-fcd-retained-release"
+	cvi := newCVI(volID, nil, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "", 4, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+
+	pv := newTestPV("test-pv")
+	pvc := newTestPVC("test-pvc", "test-ns")
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, pv, pvc}, interceptor.Funcs{})
+
+	createCalled, folderURLCalled := false, false
+	mgr := &testVolumeManager{
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+	mgr.getDiskFolderURLFn = func(_ context.Context, _ string) (string, error) {
+		folderURLCalled = true
+		return "", nil
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, createCalled, "CreateVolume must NOT be called on the fcd-retained skip branch")
+	assert.False(t, folderURLCalled, "the folder-URL conversion must NOT run on the fcd-retained skip branch")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	assert.NotContains(t, updated.Annotations, csivolumeinfov1alpha1.FcdRetainedAnnotation)
+	assert.NotContains(t, updated.Finalizers, csivolumeinfov1alpha1.VolumeProtectionFinalizer)
 }
 
 // TestReconcile_UnregisterFaultWithoutFeasibilityDefersAsStructural verifies

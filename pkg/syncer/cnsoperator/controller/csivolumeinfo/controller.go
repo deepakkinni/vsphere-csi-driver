@@ -119,16 +119,44 @@ type Reconciler struct {
 	cviSvc        csivolumeinfosvc.CsiVolumeInfoService
 }
 
+// hasDependentEntry reports whether spec.vms contains at least one Persistent
+// (dependent) entry. An empty DiskMode is treated as Persistent, matching
+// vm.spec's own default for compatibility — but that also means a
+// vm-operator build that forgets to set the field silently gets ownership
+// transfer on what may be an independent disk. The webhook cannot catch this
+// (an empty value is legal), so the omission is logged at Warn to keep it
+// visible in the field.
+func hasDependentEntry(ctx context.Context, vms []csivolumeinfov1alpha1.VirtualMachineRef) bool {
+	log := logger.GetLogger(ctx)
+	has := false
+	for _, vm := range vms {
+		if vm.DiskMode == "" {
+			log.Warnf("hasDependentEntry: VM %q has no explicit diskMode; treating as Persistent", vm.VMName)
+		}
+		if vm.DiskMode == "" || vm.DiskMode == csivolumeinfov1alpha1.DiskModePersistent {
+			has = true
+		}
+	}
+	return has
+}
+
 // Reconcile reads the state of the CsiVolumeInfo CR and drives the volume
 // ownership state machine.  The controller is the sole writer of
 // status.ownership and status.phase; vm-operator is the sole writer of
 // spec.vms.
 //
-// Decision table:
+// Decision table (hasDependent = any Persistent entry in spec.vms; empty ⇒ Persistent):
 //
-//	len(spec.vms)>0 ∧ (ownership=="" || ownership=="CSIManaged") → reconcileUnregister
-//	len(spec.vms)==0 ∧ ownership=="VMManaged"                    → reconcileRegister
-//	otherwise                                                     → idle (no-op)
+//	hasDependent  ∧ (ownership=="" ∨ ownership=="CSIManaged")        → reconcileUnregister
+//	ownership=="VMManaged" ∧ fcd-retained ∧ len(spec.vms)>0          → convergence (C8; no-op here)
+//	!hasDependent ∧ ownership=="VMManaged"                           → reconcileRegister
+//	len(spec.vms)>0 ∧ !hasDependent ∧ ownership=="CSIManaged"        → idle (independent-only; CSI never owns it)
+//	len(spec.vms)==0 ∧ ownership==""                                 → initial CSIManaged
+//	otherwise                                                        → idle (no-op)
+//
+// Independent-only and no-entries are kept as separate cases rather than
+// collapsed into one "idle for ownership" bucket: both mean CSI is idle, but
+// only the second (no entries) permits release.
 func (r *Reconciler) Reconcile(ctx context.Context,
 	req reconcile.Request) (reconcile.Result, error) {
 	ctx = logger.NewContextWithLogger(ctx)
@@ -166,10 +194,14 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 
 	vmCount := len(cvi.Spec.VMs)
 	ownership := cvi.Status.Ownership
+	hasDependent := hasDependentEntry(ctx, cvi.Spec.VMs)
+	_, fcdRetained := cvi.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation]
+	log.Infof("Reconcile: vmCount=%d hasDependent=%t ownership=%q fcdRetained=%t for %s",
+		vmCount, hasDependent, ownership, fcdRetained, req.Name)
 
 	switch {
-	case vmCount > 0 && (ownership == "" || ownership == csivolumeinfov1alpha1.OwnershipStateCSIManaged):
-		log.Infof("Reconcile: %d VM(s) attached, ownership=%q → reconcileUnregister", vmCount, ownership)
+	case hasDependent && (ownership == "" || ownership == csivolumeinfov1alpha1.OwnershipStateCSIManaged):
+		log.Infof("Reconcile: %d VM(s) attached (dependent), ownership=%q → reconcileUnregister", vmCount, ownership)
 		if err := r.reconcileUnregister(ctx, cvi); err != nil {
 			var transientErr *transientUnregisterBlockError
 			if errors.As(err, &transientErr) {
@@ -190,8 +222,15 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 		}
 		updateBackoffEntry(ctx, nn, time.Second)
 
-	case vmCount == 0 && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged:
-		log.Infof("Reconcile: no VMs attached, ownership=VMManaged → reconcileRegister")
+	case vmCount > 0 && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged && fcdRetained:
+		// Still attached, still deferred: this is a re-attempt candidate for
+		// C8's convergence watch, not this reconciler's job. Detach (the
+		// release case below) remains the backstop if it never converges.
+		log.Infof("Reconcile: volume %q is fcd-retained with %d VM(s) still attached; "+
+			"awaiting convergence — no action", cvi.Spec.VolumeID, vmCount)
+
+	case !hasDependent && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged:
+		log.Infof("Reconcile: no dependent VM(s) attached, ownership=VMManaged → reconcileRegister")
 		if err := r.reconcileRegister(ctx, cvi); err != nil {
 			log.Errorf("Reconcile: reconcileRegister failed: %v", err)
 			if statusErr := r.setFailedStatus(ctx, cvi, err.Error()); statusErr != nil {
@@ -201,6 +240,14 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 			return reconcile.Result{RequeueAfter: backoff}, nil
 		}
 		updateBackoffEntry(ctx, nn, time.Second)
+
+	case vmCount > 0 && !hasDependent && ownership == csivolumeinfov1alpha1.OwnershipStateCSIManaged:
+		// Independent-only: the FCD stays registered and CSI-managed for the
+		// life of the attachment. C9 (usedby-vm) and C10's PVC finalizer key
+		// on spec.vms being non-empty, not on this branch, so they still run
+		// here once implemented — this case exists so that fact is visible
+		// in the log rather than falling through to the generic idle case.
+		log.Infof("Reconcile: %d independent VM(s) attached, ownership=CSIManaged; idle for ownership", vmCount)
 
 	case vmCount == 0 && ownership == "":
 		// Initial state: CR just created, no VMs attached yet. Write the initial
@@ -504,18 +551,29 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 
 // reconcileRegister re-registers a formerly VM-managed VMDK as a first-class
 // disk (FCD) with full Kubernetes metadata, and transitions the CVI to
-// CSIManaged ownership.
+// CSIManaged ownership. If the volume is fcd-retained, there is nothing to
+// register — the FCD was never unregistered — so this short-circuits to
+// finishRelease instead.
 //
 // Steps:
-//  1. Fetch the PVC and PV referenced by spec.pvcNamespace/pvcName and spec.pvName.
-//  2. Reconstruct CNS entity metadata.
-//  3. Resolve the SPBM storage policy ID from PV volumeAttributes or StorageClass.
-//  4. Call volumeManager.CreateVolume (re-register); CnsVolumeAlreadyExistsFault → success.
-//  5. Patch status: ownership=CSIManaged, phase=Succeeded, observedGeneration, Ready=True.
-//  6. Remove the volume-protection finalizer.
+//  1. If fcd-retained, skip straight to finishRelease: no CreateVolume, no
+//     folder-URL conversion (the retained FCD is already a normal FCD).
+//  2. Otherwise: fetch the PVC and PV referenced by spec.pvcNamespace/pvcName and spec.pvName.
+//  3. Reconstruct CNS entity metadata.
+//  4. Resolve the SPBM storage policy ID from PV volumeAttributes or StorageClass.
+//  5. Convert spec.diskPath to a folder URL and call volumeManager.CreateVolume
+//     (re-register); CnsVolumeAlreadyExistsFault → success.
+//  6. finishRelease: clear fcd-retained if present, patch status to
+//     CSIManaged/Succeeded, remove the volume-protection finalizer.
 func (r *Reconciler) reconcileRegister(ctx context.Context,
 	cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
 	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+
+	if _, retained := cvi.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation]; retained {
+		log.Infof("reconcileRegister: volume %q is fcd-retained; the FCD was never unregistered — "+
+			"skipping CreateVolume and folder-URL conversion", cvi.Spec.VolumeID)
+		return r.finishRelease(ctx, cvi)
+	}
 	log.Infof("reconcileRegister: starting for volume %q (diskPath=%q)", cvi.Spec.VolumeID, cvi.Spec.DiskPath)
 
 	// Fetch PVC.
@@ -617,22 +675,51 @@ func (r *Reconciler) reconcileRegister(ctx context.Context,
 		log.Infof("reconcileRegister: CreateVolume succeeded for volume %q", cvi.Spec.VolumeID)
 	}
 
-	// Patch status: ownership=CSIManaged, phase=Succeeded.
+	return r.finishRelease(ctx, cvi)
+}
+
+// finishRelease flips the CVI back to CSIManaged/Succeeded and removes the
+// volume-protection finalizer — the common tail of both the fcd-retained
+// skip branch and a completed re-register, kept as one helper so the two
+// paths cannot drift apart. Clears the fcd-retained annotation first, if
+// present, so status.ownership never reads CSIManaged while the annotation
+// still claims the FCD is retained.
+func (r *Reconciler) finishRelease(ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
+	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+
+	if _, retained := cvi.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation]; retained {
+		annotationPatch, err := json.Marshal(map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					csivolumeinfov1alpha1.FcdRetainedAnnotation: nil,
+				},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("finishRelease: failed to marshal fcd-retained clear patch for %q: %w",
+				cvi.Spec.VolumeID, err)
+		}
+		if _, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, annotationPatch); err != nil {
+			return fmt.Errorf("finishRelease: failed to clear fcd-retained annotation for %q: %w",
+				cvi.Spec.VolumeID, err)
+		}
+		log.Infof("finishRelease: fcd-retained annotation cleared for volume %q", cvi.Spec.VolumeID)
+	}
+
 	statusPatch := buildStatusPatch(cvi.Generation,
 		csivolumeinfov1alpha1.OwnershipStateCSIManaged,
 		csivolumeinfov1alpha1.PhaseSucceeded, "", "", reasonRegisterSucceeded, true)
 	if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, statusPatch); err != nil {
-		return fmt.Errorf("reconcileRegister: failed to patch status for %q: %w",
+		return fmt.Errorf("finishRelease: failed to patch status for %q: %w",
 			cvi.Spec.VolumeID, err)
 	}
-	log.Infof("reconcileRegister: status patched to CSIManaged/Succeeded for volume %q", cvi.Spec.VolumeID)
+	log.Infof("finishRelease: status patched to CSIManaged/Succeeded for volume %q", cvi.Spec.VolumeID)
 
-	// Remove the volume-protection finalizer now the volume is CSI-managed again.
 	if err := r.cviSvc.RemoveVolumeProtectionFinalizer(ctx, cvi.Spec.VolumeID); err != nil {
-		return fmt.Errorf("reconcileRegister: failed to remove protection finalizer for %q: %w",
+		return fmt.Errorf("finishRelease: failed to remove protection finalizer for %q: %w",
 			cvi.Spec.VolumeID, err)
 	}
-	log.Infof("reconcileRegister: volume-protection finalizer removed for volume %q", cvi.Spec.VolumeID)
+	log.Infof("finishRelease: volume-protection finalizer removed for volume %q", cvi.Spec.VolumeID)
 	return nil
 }
 
