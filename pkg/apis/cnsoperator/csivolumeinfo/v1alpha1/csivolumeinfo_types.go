@@ -29,6 +29,15 @@ const (
 	// VolumeProtectionFinalizer prevents GC while ownership is VMManaged.
 	VolumeProtectionFinalizer = "csi.vsphere.vmware.com/volume-protection"
 
+	// PVCVolumeProtectionFinalizer is written by the CVI controller onto the
+	// bound PVC while spec.vms is non-empty, and is the only thing preventing
+	// deletion of an attached PVC for an independent volume: that CVI never
+	// transitions to VMManaged, so VolumeProtectionFinalizer above never
+	// applies to it. Deliberately a distinct key from the CnsNodeVMBatchAttachment
+	// controller's own PVC finalizer — two controllers writing one finalizer
+	// key cannot be reasoned about independently.
+	PVCVolumeProtectionFinalizer = "csi.vsphere.vmware.com/pvc-volume-protection"
+
 	// CVINamespace is the namespace where all CsiVolumeInfo CRs live.
 	CVINamespace = "vmware-system-csi"
 

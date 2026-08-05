@@ -201,6 +201,15 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 		return reconcile.Result{}, err
 	}
 
+	// usedby-vm annotations and the pvc-volume-protection finalizer are
+	// orthogonal to the ownership state machine below — they key on
+	// spec.vms being non-empty, not on status.ownership, so this runs
+	// unconditionally on every branch including the idle ones.
+	if err := r.syncPVCUsedByAndProtection(ctx, cvi); err != nil {
+		log.Errorf("Reconcile: failed to sync PVC usedby-vm/finalizer for %s: %v", req.Name, err)
+		return reconcile.Result{}, err
+	}
+
 	vmCount := len(cvi.Spec.VMs)
 	ownership := cvi.Status.Ownership
 	hasDependent := hasDependentEntry(ctx, cvi.Spec.VMs)
