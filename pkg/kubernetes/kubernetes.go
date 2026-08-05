@@ -61,6 +61,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 
 	cnsoperatorv1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	migrationv1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/migration/v1alpha1"
 	storagepoolAPIs "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/storagepool"
 	wcpcapapis "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/wcpcapabilities"
@@ -282,6 +283,11 @@ func NewClientForGroup(ctx context.Context, config *restclient.Config, groupName
 		err = cnsvolumeinfov1alpha1.AddToScheme(scheme)
 		if err != nil {
 			log.Errorf("failed to add CNSVolumeInfo to scheme with error: %+v", err)
+			return nil, err
+		}
+		err = csivolumeinfov1alpha1.AddToScheme(scheme)
+		if err != nil {
+			log.Errorf("failed to add CsiVolumeInfo to scheme with error: %+v", err)
 			return nil, err
 		}
 

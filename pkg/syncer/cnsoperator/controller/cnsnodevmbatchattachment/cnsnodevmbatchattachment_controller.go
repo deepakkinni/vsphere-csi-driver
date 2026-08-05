@@ -283,6 +283,16 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 	log.Debugf("Reconciling CnsNodeVMBatchAttachment with Request.Name: %q instance %q timeout %q seconds",
 		request.Name, instance.Name, timeout)
 
+	// vm-operator freezes the BA during migration by setting this annotation. CSI
+	// only reads it: no attach, no detach for this VM until it is cleared or moves
+	// to Complete.
+	if instance.Annotations[cnsoperatortypes.VmOwnedMigrationAnnotation] == cnsoperatortypes.VmOwnedMigrationInProgress {
+		log.Infof("CnsNodeVMBatchAttachment %s is frozen for migration (%s: %s). Skipping reconcile.",
+			request.NamespacedName.String(), cnsoperatortypes.VmOwnedMigrationAnnotation,
+			cnsoperatortypes.VmOwnedMigrationInProgress)
+		return reconcile.Result{}, nil
+	}
+
 	// Initialise volumeStatus if it is set to nil
 	if instance.Status.VolumeStatus == nil {
 		instance.Status.VolumeStatus = make([]v1alpha1.VolumeStatus, 0)

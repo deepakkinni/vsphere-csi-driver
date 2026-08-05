@@ -38,6 +38,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	cnsopv1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/cnsnodevmattachment/v1alpha1"
 	"sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/cnsnodevmbatchattachment/v1alpha1"
+	csivolumeinfosvc "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	volumes "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/volume"
 	cnsvsphere "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/vsphere"
 	"sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/config"
@@ -56,7 +58,7 @@ var (
 
 	// removePvcFinalizerFn is a package-level function variable so tests can
 	// inject a fake implementation without architecture-specific monkey patching.
-	removePvcFinalizerFn = removePvcFinalizer
+	removePvcFinalizerFn = removePvcFinalizerWithUsedByAnnotation
 )
 
 const (
@@ -104,7 +106,7 @@ func removePvcProtectionFinalizersForTrackedPVCs(ctx context.Context,
 
 	for pvcName, volumeName := range getPvcsFromSpecAndStatus(ctx, instance) {
 		err := removePvcFinalizerFn(ctx, c, k8sClient, cnsOperatorClient,
-			pvcName, instance.Namespace, instance.Spec.InstanceUUID)
+			pvcName, instance.Namespace, instance.Spec.InstanceUUID, false)
 		if err != nil {
 			updateInstanceVolumeStatus(ctx, instance, volumeName, pvcName, "", "", err,
 				v1alpha1.ConditionDetached, v1alpha1.ReasonDetachFailed)
@@ -145,10 +147,41 @@ func removeFinalizerFromCRDInstance(ctx context.Context,
 	return k8s.PatchFinalizers(ctx, c, instance, finalizersOnInstance)
 }
 
+// isVolumeHandedOffToVM returns true if a CsiVolumeInfo exists for volumeID whose
+// spec.vms references vmInstanceUUID. This is keyed on the CVI handoff, not on
+// status.ownership: a re-homed independent disk is still CSIManaged, and skipping
+// it here only for VMManaged disks would cause the BA to detach every independent
+// disk on every migrated VM.
+func isVolumeHandedOffToVM(ctx context.Context, cnsOperatorClient client.Client,
+	volumeID string, vmInstanceUUID string) (bool, error) {
+	log := logger.GetLogger(ctx)
+
+	cvi := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	err := cnsOperatorClient.Get(ctx, types.NamespacedName{
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volumeID),
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+	}, cvi)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		log.Errorf("failed to get CsiVolumeInfo for volume %s. Err: %s", volumeID, err)
+		return false, err
+	}
+
+	for _, vm := range cvi.Spec.VMs {
+		if vm.VMInstanceUUID == vmInstanceUUID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // getVolumesToDetachFromInstance finds out which are the volumes to detach by finding out which are
 // the volumes present in attachedFCDs but not in spec of the instance.
 func getVolumesToDetachFromInstance(ctx context.Context,
 	instance *v1alpha1.CnsNodeVMBatchAttachment,
+	cnsOperatorClient client.Client,
 	attachedFCDs map[string]FCDBackingDetails,
 	volumeIdsInSpec map[string]FCDBackingDetails) (pvcsToDetach map[string]string, err error) {
 	log := logger.GetLogger(ctx)
@@ -160,6 +193,20 @@ func getVolumesToDetachFromInstance(ctx context.Context,
 	// which are present in attachedFCDs list but not in
 	// instance spec.
 	for attachedFcdId, attachedFcdIdBacking := range attachedFCDs {
+		// If a CsiVolumeInfo already lists this VM in spec.vms, the disk has been
+		// handed off to the CVI path (dependent or independent, keyed on the
+		// handoff, not on ownership). Detaching here would race the handoff, so
+		// skip it and let it drop out of the batch attach status instead.
+		handedOff, err := isVolumeHandedOffToVM(ctx, cnsOperatorClient, attachedFcdId, instance.Spec.InstanceUUID)
+		if err != nil {
+			return pvcsToDetach, err
+		}
+		if handedOff {
+			log.Debugf("FCD %s is already handed off to VM %s via CsiVolumeInfo. Skipping detach.",
+				attachedFcdId, instance.Spec.InstanceUUID)
+			continue
+		}
+
 		// Get PVC name for the given FCD.
 		pvcName, pvcNs, exists := commonco.ContainerOrchestratorUtility.GetPVCNameFromCSIVolumeID(attachedFcdId)
 		if !exists {
@@ -391,7 +438,7 @@ func getVolumesToDetachForVmFromVC(ctx context.Context,
 
 	// Find out the volumes to detach by taking a diff between
 	// the instance spec and the FCDs currently attached to the VM on vCenter.
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, instance, cnsOperatorClient, attachedFCDs, volumeIdsInSpec)
 	if err != nil {
 		log.Errorf("failed to find volumes to attach and volumes to detach from instance spec. Err: %s", err)
 		return pvcsToDetach, err
@@ -695,6 +742,12 @@ func getVolumesToAttachAndDetach(ctx context.Context, instance *v1alpha1.CnsNode
 	pvcsToAttach := make(map[string]string, 0)
 	pvcsToDetach := make(map[string]string, 0)
 
+	if instance.Annotations[cnsoperatortypes.VmOwnedMigrationAnnotation] == cnsoperatortypes.VmOwnedMigrationComplete {
+		log.Infof("Instance %s has completed migration (%s: %s). Building no attach and no detach set.",
+			instance.Name, cnsoperatortypes.VmOwnedMigrationAnnotation, cnsoperatortypes.VmOwnedMigrationComplete)
+		return pvcsToAttach, pvcsToDetach, nil
+	}
+
 	// Query vCenter to find the list of FCDs which are attached to the VM.
 	attachedFcdList, err := listAttachedFcdsForVM(ctx, vm)
 	if err != nil {
@@ -916,6 +969,20 @@ func removePvcFinalizer(ctx context.Context, patchClient client.Client,
 	k8sClient kubernetes.Interface,
 	cnsOperatorClient client.Client,
 	pvcName string, namespace string, vmInstanceUUID string) error {
+	return removePvcFinalizerWithUsedByAnnotation(ctx, patchClient, k8sClient, cnsOperatorClient,
+		pvcName, namespace, vmInstanceUUID, true)
+}
+
+// removePvcFinalizerWithUsedByAnnotation removes the CNS PVC protection finalizer
+// from the PVC, and removes the usedby-vm annotation for vmInstanceUUID only when
+// removeUsedByAnnotation is true. During migration handoff (CR deletion after
+// vm-operator has emptied spec.volumes), the disk's ownership of the PVC has
+// moved to the CVI path: releasing pvc-protection here is safe, but removing
+// usedby-vm would be wrong since the VM still uses the volume, just through CVI.
+func removePvcFinalizerWithUsedByAnnotation(ctx context.Context, patchClient client.Client,
+	k8sClient kubernetes.Interface,
+	cnsOperatorClient client.Client,
+	pvcName string, namespace string, vmInstanceUUID string, removeUsedByAnnotation bool) error {
 	log := logger.GetLogger(ctx)
 
 	namespacedVolumeName := namespace + "/" + pvcName
@@ -952,23 +1019,27 @@ func removePvcFinalizer(ctx context.Context, patchClient client.Client,
 		}
 	}
 
-	// Remove usedby annotation
-	err = removePvcAnnotation(ctx, k8sClient, vmInstanceUUID, pvc)
-	if err != nil {
-		return err
+	if removeUsedByAnnotation {
+		// Remove usedby annotation
+		err = removePvcAnnotation(ctx, k8sClient, vmInstanceUUID, pvc)
+		if err != nil {
+			return err
+		}
+		log.Infof("Successfully updated annotations on PVC %s for VM %s", pvcName, vmInstanceUUID)
+	} else {
+		log.Infof("Releasing pvc-protection finalizer for PVC %s without touching usedby-vm annotations "+
+			"for VM %s. Ownership has moved to the CVI path.", pvcName, vmInstanceUUID)
 	}
-	log.Infof("Successfully updated annotations on PVC %s for VM %s", pvcName, vmInstanceUUID)
 
-	// Obtain the latest PVC again with updated annotations.
-	// Cannot rely on informer cache as it may not be updated.
+	// Obtain the latest PVC again so the finalizer check and patch below operate on
+	// current state. Cannot rely on informer cache as it may not be updated.
 	pvc, err = k8sClient.CoreV1().PersistentVolumeClaims(pvc.Namespace).Get(ctx, pvcName, metav1.GetOptions{})
 	if err != nil {
 		log.Errorf("failed to get updated PVC %s in namespace %s", pvcName, namespace)
 		return err
-
 	}
 
-	if pvcHasUsedByAnnotaion(ctx, pvc) {
+	if removeUsedByAnnotation && pvcHasUsedByAnnotaion(ctx, pvc) {
 		log.Infof("PVC %s is still being use by other VMs. Not removing finalizer.", pvcName)
 		return nil
 	}

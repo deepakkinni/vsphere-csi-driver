@@ -53,6 +53,17 @@ const (
 	// to handle deletion gracefully and prevent race conditions with unregister operations.
 	CNSRegisterVolumeFinalizer = "cns.vmware.com/register-volume"
 
+	// VmOwnedMigrationAnnotation is written by vm-operator on a CnsNodeVMBatchAttachment
+	// to drive the brownfield migration lifecycle. CSI only reads it.
+	VmOwnedMigrationAnnotation = "cns.vmware.com/vm-owned-migration"
+
+	// VmOwnedMigrationInProgress freezes the BA controller: no attach, no detach.
+	VmOwnedMigrationInProgress = "InProgress"
+
+	// VmOwnedMigrationComplete retires the BA controller: no attach set, no detach
+	// set is built; every disk is on the CVI path.
+	VmOwnedMigrationComplete = "Complete"
+
 	// VSphereCSIDriverName is the vsphere CSI driver name
 	VSphereCSIDriverName = "csi.vsphere.vmware.com"
 
