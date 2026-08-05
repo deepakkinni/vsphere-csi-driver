@@ -132,12 +132,20 @@ func (g *genBumpingCviService) PatchCsiVolumeInfo(
 // ---------------------------------------------------------------------------
 
 // testVolumeManager is a test-scoped implementation of volumes.Manager that
-// lets each test control the behaviour of UnregisterVolumeEx and CreateVolume
-// independently.
+// lets each test control the behaviour of QueryLiveDiskPath, UnregisterVolumeEx,
+// and CreateVolume independently.
 type testVolumeManager struct {
+	queryLiveDiskPathFn  func(ctx context.Context, volumeID string) (string, error)
 	unregisterVolumeExFn func(ctx context.Context, volumeID string) (string, string, error)
 	createVolumeFn       func(ctx context.Context, spec *cnstypes.CnsVolumeCreateSpec,
 		extraParams interface{}) (*cnsvolumes.CnsVolumeInfo, string, error)
+}
+
+func (m *testVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	if m.queryLiveDiskPathFn != nil {
+		return m.queryLiveDiskPathFn(ctx, volumeID)
+	}
+	return "test-live-disk-path", nil
 }
 
 func (m *testVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, error) {
@@ -477,6 +485,92 @@ func TestReconcile_UnregisterTransition(t *testing.T) {
 	// controller's own diskPath/diskUUID spec write) so the green signal is satisfiable.
 	assert.Equal(t, updated.Generation, updated.Status.ObservedGeneration)
 	assert.Empty(t, updated.Status.Error)
+}
+
+// TestReconcile_UnregisterCapturesLiveDiskPathBeforeUnregister verifies the
+// crash-recovery ordering: QueryLiveDiskPath is called and its result is
+// patched onto spec.diskPath strictly before UnregisterVolumeEx is called, so
+// a crash between the two still leaves the CVI holding a valid disk path.
+func TestReconcile_UnregisterCapturesLiveDiskPathBeforeUnregister(t *testing.T) {
+	const volID = "vol-ordering"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "", "", 3, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	var diskPathAtUnregisterTime string
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, id string) (string, error) {
+			assert.Equal(t, volID, id)
+			return "/vmfs/volumes/ds/live-tip.vmdk", nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, id string) (string, string, error) {
+			// By the time UnregisterVolumeEx runs, the live path must already be
+			// durable on the CVI — read it back from the fake store rather than
+			// trusting an in-memory ordering flag.
+			existing := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+			require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+				Namespace: csivolumeinfov1alpha1.CVINamespace,
+				Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+			}, existing))
+			diskPathAtUnregisterTime = existing.Spec.DiskPath
+			return "/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	_, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.Equal(t, "/vmfs/volumes/ds/live-tip.vmdk", diskPathAtUnregisterTime,
+		"spec.diskPath must hold the live-queried path at the moment UnregisterVolumeEx is called")
+}
+
+// TestReconcile_UnregisterLiveDiskPathFailureBlocksUnregister verifies that a
+// QueryLiveDiskPath failure (including NotFound, which the manager can return
+// transiently right after a storage vMotion) is treated as retryable: the
+// reconcile fails without ever calling UnregisterVolumeEx, and no disk path
+// is fabricated.
+func TestReconcile_UnregisterLiveDiskPathFailureBlocksUnregister(t *testing.T) {
+	const volID = "vol-live-path-notfound"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "", "", 3, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			return "", errors.New("NotFound")
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, error) {
+			unregisterCalled = true
+			return "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.False(t, res.IsZero(), "a live-path failure must requeue rather than drop the volume")
+	assert.False(t, unregisterCalled, "UnregisterVolumeEx must not run without a captured live path")
 }
 
 // TestReconcile_UnregisterObservedGenerationTracksSpecWrite verifies that the

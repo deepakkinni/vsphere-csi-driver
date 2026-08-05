@@ -276,6 +276,10 @@ func (m *mockVolumeManager) GetDiskFolderURL(ctx context.Context, datastorePath 
 	return "", nil
 }
 
+func (m *mockVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	return "", nil
+}
+
 type mockCOCommon struct{}
 
 func (m *mockCOCommon) ListPVCs(ctx context.Context, namespace string) []*corev1.PersistentVolumeClaim {

@@ -245,6 +245,15 @@ func (m MockManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (s
 	return "", "", nil
 }
 
+// QueryLiveDiskPath is the mock implementation of the live disk-path read.
+// Returns the configured error on failure, otherwise an empty path.
+func (m MockManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	if m.failRequest {
+		return "", m.err
+	}
+	return "", nil
+}
+
 // GetDiskFolderURL is the mock implementation; always returns an empty string.
 func (m MockManager) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
 	return "", nil

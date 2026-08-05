@@ -256,6 +256,11 @@ func (m *MockVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID str
 	return "", "", nil
 }
 
+// QueryLiveDiskPath is a stub implementation of the live disk-path read.
+func (m *MockVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	return "", nil
+}
+
 // GetDiskFolderURL is a stub implementation.
 func (m *MockVolumeManager) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
 	return "", nil

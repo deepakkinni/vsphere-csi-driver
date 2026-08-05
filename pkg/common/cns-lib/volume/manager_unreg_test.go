@@ -57,6 +57,31 @@ func TestMockUnregisterVolumeExFailure(t *testing.T) {
 	assert.Equal(t, sentinelErr, err)
 }
 
+// TestMockQueryLiveDiskPathSuccess verifies the success path of the mock.
+func TestMockQueryLiveDiskPathSuccess(t *testing.T) {
+	ctx := context.Background()
+	m := NewMockManager(false, nil, "")
+
+	path, err := m.QueryLiveDiskPath(ctx, "test-volume-id")
+
+	require.NoError(t, err)
+	assert.Empty(t, path)
+}
+
+// TestMockQueryLiveDiskPathFailure verifies the error path of the mock,
+// standing in for a NotFound the live query can return transiently right
+// after a storage vMotion to a different datastore.
+func TestMockQueryLiveDiskPathFailure(t *testing.T) {
+	ctx := context.Background()
+	sentinelErr := errors.New("NotFound")
+	m := NewMockManager(true, sentinelErr, "vim25:NotFound")
+
+	_, err := m.QueryLiveDiskPath(ctx, "test-volume-id")
+
+	require.Error(t, err)
+	assert.Equal(t, sentinelErr, err)
+}
+
 // TestDefaultManagerUnregisterVolumeExNilVC verifies that UnregisterVolumeEx
 // returns an error immediately when the virtualCenter is nil (no live VC
 // required for this unit test path).
@@ -68,6 +93,19 @@ func TestDefaultManagerUnregisterVolumeExNilVC(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "virtual center connection not established")
+}
+
+// TestDefaultManagerQueryLiveDiskPathNilVC verifies that QueryLiveDiskPath
+// returns an error immediately when the virtualCenter is nil (no live VC
+// required for this unit test path).
+func TestDefaultManagerQueryLiveDiskPathNilVC(t *testing.T) {
+	ctx := context.Background()
+	m := &defaultManager{} // virtualCenter is nil
+
+	_, err := m.QueryLiveDiskPath(ctx, "vol-001")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "virtual Center connection not established")
 }
 
 // TestUnregisterVolumeResultType verifies that the CnsUnregisterVolumeResult

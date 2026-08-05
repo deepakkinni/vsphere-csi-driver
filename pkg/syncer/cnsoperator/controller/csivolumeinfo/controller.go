@@ -210,19 +210,68 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 	return reconcile.Result{}, nil
 }
 
-// reconcileUnregister executes the two-phase CNS unregister protocol and
-// transitions the CVI to VMManaged ownership.
+// reconcileUnregister captures the volume's live disk identity, then attempts
+// a best-effort unregister, and transitions the CVI to VMManaged ownership.
 //
 // Steps:
-//  1. Call volumeManager.UnregisterVolumeEx → get backingDiskPath, diskUUID.
-//  2. Patch spec.diskPath and spec.diskUUID onto the CVI.
-//  3. Add the volume-protection finalizer so GC is blocked while VM-managed.
+//  1. Call volumeManager.QueryLiveDiskPath and patch spec.diskPath with the
+//     result. Add the volume-protection finalizer. This durably records the
+//     disk's location before the destructive call below, so a crash anywhere
+//     after this point is recoverable from the CVI alone.
+//  2. Call volumeManager.UnregisterVolumeEx.
+//  3. On success, patch spec.diskPath and spec.diskUUID from the result — this
+//     supersedes step 1's value. (Fault classification is C5's job.)
 //  4. Patch status: ownership=VMManaged, phase=Succeeded, observedGeneration, Ready=True.
 func (r *Reconciler) reconcileUnregister(ctx context.Context,
 	cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
 	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
-	log.Infof("reconcileUnregister: calling UnregisterVolumeEx for volume %q", cvi.Spec.VolumeID)
+	log.Infof("reconcileUnregister: calling QueryLiveDiskPath for volume %q", cvi.Spec.VolumeID)
 
+	livePath, err := r.volumeManager.QueryLiveDiskPath(ctx, cvi.Spec.VolumeID)
+	if err != nil {
+		// Includes NotFound, which the manager's live query can return
+		// transiently right after a storage vMotion to a different datastore.
+		// That is retryable, not evidence the disk is gone, so the unregister
+		// below must not be attempted without a path.
+		return fmt.Errorf("reconcileUnregister: QueryLiveDiskPath failed for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileUnregister: QueryLiveDiskPath succeeded for volume %q — diskPath=%q",
+		cvi.Spec.VolumeID, livePath)
+
+	livePathPatch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"diskPath": livePath,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("reconcileUnregister: failed to marshal live-path spec patch for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	// The spec patch increments metadata.generation, so capture the post-patch
+	// generation. observedGeneration must reflect this latest generation;
+	// otherwise vm-operator's green-signal check (observedGeneration >= generation)
+	// would never be satisfied, because the controller's own spec write advanced
+	// generation beyond the value observed at reconcile entry. There are two
+	// spec patches in this function; the second (step 3) supersedes this value.
+	patchedGen, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, livePathPatch)
+	if err != nil {
+		return fmt.Errorf("reconcileUnregister: failed to patch live spec.diskPath for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileUnregister: patched live spec.diskPath for volume %q (generation=%d)",
+		cvi.Spec.VolumeID, patchedGen)
+
+	// Add the volume-protection finalizer before the destructive call so GC is
+	// blocked. Finalizer changes are metadata-only and do not advance
+	// generation, so patchedGen remains the generation to record in status.
+	if err := r.cviSvc.AddVolumeProtectionFinalizer(ctx, cvi.Spec.VolumeID); err != nil {
+		return fmt.Errorf("reconcileUnregister: failed to add protection finalizer for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileUnregister: volume-protection finalizer added for volume %q", cvi.Spec.VolumeID)
+
+	log.Infof("reconcileUnregister: calling UnregisterVolumeEx for volume %q", cvi.Spec.VolumeID)
 	backingDiskPath, diskUUID, err := r.volumeManager.UnregisterVolumeEx(ctx, cvi.Spec.VolumeID)
 	if err != nil {
 		return fmt.Errorf("reconcileUnregister: UnregisterVolumeEx failed for %q: %w",
@@ -231,7 +280,8 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 	log.Infof("reconcileUnregister: UnregisterVolumeEx succeeded — diskPath=%q, diskUUID=%q",
 		backingDiskPath, diskUUID)
 
-	// Persist diskPath and diskUUID onto the spec so vm-operator can use them for attachment.
+	// Persist diskPath and diskUUID from the unregister result; this
+	// supersedes the live path patched in step 1.
 	specPatch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
 			"diskPath": backingDiskPath,
@@ -242,27 +292,13 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 		return fmt.Errorf("reconcileUnregister: failed to marshal spec patch for %q: %w",
 			cvi.Spec.VolumeID, err)
 	}
-	// The spec patch increments metadata.generation, so capture the post-patch
-	// generation. observedGeneration must reflect this latest generation;
-	// otherwise vm-operator's green-signal check (observedGeneration >= generation)
-	// would never be satisfied, because the controller's own spec write advanced
-	// generation beyond the value observed at reconcile entry.
-	patchedGen, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, specPatch)
+	patchedGen, err = r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, specPatch)
 	if err != nil {
 		return fmt.Errorf("reconcileUnregister: failed to patch spec for %q: %w",
 			cvi.Spec.VolumeID, err)
 	}
 	log.Infof("reconcileUnregister: patched spec.diskPath and spec.diskUUID for volume %q (generation=%d)",
 		cvi.Spec.VolumeID, patchedGen)
-
-	// Add the volume-protection finalizer before status transition so GC is blocked.
-	// Finalizer changes are metadata-only and do not advance generation, so
-	// patchedGen remains the generation to record in status.
-	if err := r.cviSvc.AddVolumeProtectionFinalizer(ctx, cvi.Spec.VolumeID); err != nil {
-		return fmt.Errorf("reconcileUnregister: failed to add protection finalizer for %q: %w",
-			cvi.Spec.VolumeID, err)
-	}
-	log.Infof("reconcileUnregister: volume-protection finalizer added for volume %q", cvi.Spec.VolumeID)
 
 	// Write status: ownership=VMManaged, phase=Succeeded.
 	statusPatch := buildStatusPatch(patchedGen,

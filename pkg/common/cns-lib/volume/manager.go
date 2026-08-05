@@ -184,6 +184,11 @@ type Manager interface {
 	// UnregisterVolumeEx unregisters the FCD from CNS in a single best-effort call
 	// and returns the backing-disk path and disk UUID from the result.
 	UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, error)
+	// QueryLiveDiskPath returns the volume's current backing disk path read live
+	// from the host. CNS fronts a RetrieveVStorageObject call, so the returned
+	// path is the FCD's running point (chain tip) and is authoritative even
+	// immediately after a storage vMotion, which a cached read can lag.
+	QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error)
 	// GetDiskFolderURL converts a datastore path in "[dsName] relPath" format to
 	// the HTTP folder URL format (https://host/folder/relPath?dcPath=...&dsName=...)
 	// required by CNS's RegisterVMDKWithUrlAction for re-registration after UnregisterVolumeEx.
@@ -4564,6 +4569,46 @@ func (m *defaultManager) UnregisterVolumeEx(ctx context.Context, volumeID string
 	log.Infof("UnregisterVolumeEx: exit volumeID=%q backingDiskPath=%q diskUUID=%q opId=%q",
 		volumeID, unregRes.BackingDiskPath, unregRes.DiskUUID, taskInfo.ActivationId)
 	return unregRes.BackingDiskPath, unregRes.DiskUUID, nil
+}
+
+// QueryLiveDiskPath returns the volume's current backing disk path read live
+// from the host. CNS fronts a RetrieveVStorageObject call, so the returned
+// path is the FCD's running point (chain tip) and is authoritative even
+// immediately after a storage vMotion, which a cached read can lag.
+//
+// The datastore input to the live retrieve is itself cached; after a storage
+// vMotion to a different datastore, before CNS's relocate callback lands, the
+// retrieve returns NotFound. That failure is safe (a wrong path is never
+// returned) but retryable — callers must not treat it as "no path exists".
+func (m *defaultManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	log := logger.GetLogger(ctx).With("volumeID", volumeID)
+	log.Infof("QueryLiveDiskPath: entry volumeID=%q", volumeID)
+
+	result, err := m.QueryVolumeInfo(ctx, []cnstypes.CnsVolumeId{{Id: volumeID}})
+	if err != nil {
+		log.Errorf("QueryLiveDiskPath: QueryVolumeInfo failed for volumeID=%q: %v", volumeID, err)
+		return "", fmt.Errorf("QueryVolumeInfo failed: %w", err)
+	}
+	if result == nil {
+		log.Errorf("QueryLiveDiskPath: QueryVolumeInfo returned nil result for volumeID=%q", volumeID)
+		return "", errors.New("QueryVolumeInfo returned nil result")
+	}
+
+	blockVolumeInfo, ok := result.VolumeInfo.(*cnstypes.CnsBlockVolumeInfo)
+	if !ok {
+		log.Errorf("QueryLiveDiskPath: unexpected VolumeInfo type %T for volumeID=%q", result.VolumeInfo, volumeID)
+		return "", fmt.Errorf("unexpected VolumeInfo type %T", result.VolumeInfo)
+	}
+
+	backing := blockVolumeInfo.VStorageObject.Config.Backing
+	diskFileBackingInfo, ok := backing.(*vim25types.BaseConfigInfoDiskFileBackingInfo)
+	if !ok {
+		log.Errorf("QueryLiveDiskPath: unexpected backing type %T for volumeID=%q", backing, volumeID)
+		return "", fmt.Errorf("unexpected backing type %T", backing)
+	}
+
+	log.Infof("QueryLiveDiskPath: exit volumeID=%q filePath=%q", volumeID, diskFileBackingInfo.FilePath)
+	return diskFileBackingInfo.FilePath, nil
 }
 
 // GetDiskFolderURL converts a datastore path ("[dsName] relPath") to the HTTP

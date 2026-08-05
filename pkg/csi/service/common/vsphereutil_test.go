@@ -163,6 +163,10 @@ func (m *mockVolumeManager) GetDiskFolderURL(ctx context.Context, datastorePath 
 	return "", nil
 }
 
+func (m *mockVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	return "", nil
+}
+
 func TestQueryVolumeSnapshotsByVolumeIDWithQuerySnapshotsCnsVolumeNotFoundFault(t *testing.T) {
 	// Skip test on ARM64 due to gomonkey limitations
 	if runtime.GOARCH == "arm64" {

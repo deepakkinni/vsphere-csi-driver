@@ -987,6 +987,10 @@ func (m *mockVolumeManagerForFullSync) GetDiskFolderURL(ctx context.Context, dat
 	return "", nil
 }
 
+func (m *mockVolumeManagerForFullSync) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	return "", nil
+}
+
 // TestCNSQueryBatching tests CNS query batching logic
 func TestCNSQueryBatching_VaryingBatchSizes(t *testing.T) {
 	if testing.Short() {

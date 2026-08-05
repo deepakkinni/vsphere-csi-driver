@@ -962,6 +962,9 @@ func (m *cbtFlagsMockVolumeManager) UnregisterVolumeEx(context.Context, string) 
 func (m *cbtFlagsMockVolumeManager) GetDiskFolderURL(context.Context, string) (string, error) {
 	return "", nil
 }
+func (m *cbtFlagsMockVolumeManager) QueryLiveDiskPath(context.Context, string) (string, error) {
+	return "", nil
+}
 func (m *cbtFlagsMockVolumeManager) QueryFCDAllocatedBlocks(context.Context,
 	string, string, uint64) ([]cnsvolume.DiskArea, uint64, error) {
 	return nil, 0, nil
