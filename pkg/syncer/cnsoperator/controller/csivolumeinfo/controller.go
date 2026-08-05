@@ -149,6 +149,17 @@ func hasDependentEntry(ctx context.Context, vms []csivolumeinfov1alpha1.VirtualM
 	return has
 }
 
+// hasIndependentEntry reports whether spec.vms contains at least one
+// Independent* entry.
+func hasIndependentEntry(vms []csivolumeinfov1alpha1.VirtualMachineRef) bool {
+	for _, vm := range vms {
+		if vm.DiskMode != "" && vm.DiskMode != csivolumeinfov1alpha1.DiskModePersistent {
+			return true
+		}
+	}
+	return false
+}
+
 // Reconcile reads the state of the CsiVolumeInfo CR and drives the volume
 // ownership state machine.  The controller is the sole writer of
 // status.ownership and status.phase; vm-operator is the sole writer of
@@ -216,6 +227,20 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 	_, fcdRetained := cvi.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation]
 	log.Infof("Reconcile: vmCount=%d hasDependent=%t ownership=%q fcdRetained=%t for %s",
 		vmCount, hasDependent, ownership, fcdRetained, req.Name)
+
+	// Defense in depth for the single-mode-per-volume invariant: the webhook
+	// is the primary enforcement point, this is the fallback for a webhook
+	// outage. A mixed spec.vms fails legibly rather than guessing which
+	// disk-mode behavior applies.
+	if hasDependent && hasIndependentEntry(cvi.Spec.VMs) {
+		log.Errorf("Reconcile: CsiVolumeInfo %s has mixed disk modes in spec.vms (both Persistent and "+
+			"Independent* entries); failing", req.Name)
+		if statusErr := r.setFailedStatus(ctx, cvi,
+			"spec.vms mixes a Persistent entry with an Independent* entry"); statusErr != nil {
+			log.Warnf("Reconcile: could not write failed status for mixed disk modes: %v", statusErr)
+		}
+		return reconcile.Result{}, nil
+	}
 
 	switch {
 	case hasDependent && (ownership == "" || ownership == csivolumeinfov1alpha1.OwnershipStateCSIManaged):

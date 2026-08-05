@@ -33,6 +33,15 @@ import (
 	csitypes "sigs.k8s.io/vsphere-csi-driver/v3/pkg/csi/types"
 )
 
+// cviServiceFactory matches csivolumeinfosvc.InitCsiVolumeInfoService's signature.
+type cviServiceFactory func(ctx context.Context) (csivolumeinfosvc.CsiVolumeInfoService, error)
+
+// newCviService is a package-level function variable defaulting to the real
+// constructor. Tests can override it to inject a fake CsiVolumeInfoService
+// without relying on architecture-specific monkey patching, mirroring
+// newK8sClient's pattern in validatepvc.go.
+var newCviService cviServiceFactory = csivolumeinfosvc.InitCsiVolumeInfoService
+
 const (
 	// DeleteVMOwnedVolumeErrorMessageFormat is the rejection message returned when
 	// a PVC delete is attempted while the volume is VM-managed. It takes the PVC
@@ -45,15 +54,25 @@ const (
 	// the PVC name as its single argument.
 	SnapshotVMOwnedVolumeErrorMessageFormat = "Cannot create snapshot for PVC %s: volume is VM-managed. " +
 		"Detach the volume from the VM or delete all retaining snapshots first."
+
+	// MixedDiskModeErrorMessageFormat is the rejection message returned when a
+	// CsiVolumeInfo's spec.vms mixes a Persistent (dependent) entry with an
+	// Independent* entry. It takes the CsiVolumeInfo name as its single argument.
+	MixedDiskModeErrorMessageFormat = "CsiVolumeInfo %s: spec.vms mixes a Persistent entry with an " +
+		"Independent* entry; a volume has one physical form and must attach in a single disk mode " +
+		"across all VMs"
 )
 
 // validatePVCDeletionForVMOwnedVolumes checks whether a PVC being deleted has
-// a corresponding CsiVolumeInfo in VMManaged state. If so, the deletion is
-// rejected to prevent data loss while a VM holds the disk.
+// a corresponding CsiVolumeInfo that is either VMManaged or still has an
+// attached VM in spec.vms. If so, the deletion is rejected. The second
+// disjunct is what covers an attached **independent** volume, which stays
+// CSIManaged for the life of the attachment — keying on ownership alone
+// would leave it unprotected.
 //
 // This guard is a no-op when the VMOwnedVolumes feature state is disabled,
 // when the CsiVolumeInfo cannot be resolved (fail-open to avoid blocking
-// unrelated deletes), or when the volume is already CSI-managed.
+// unrelated deletes), or when the volume is CSI-managed with no VM attached.
 func validatePVCDeletionForVMOwnedVolumes(
 	ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
 	log := logger.GetLogger(ctx)
@@ -104,7 +123,7 @@ func validatePVCDeletionForVMOwnedVolumes(
 	}
 
 	// Resolve CsiVolumeInfo by deterministic name (O(1) Get).
-	cviSvc, err := csivolumeinfosvc.InitCsiVolumeInfoService(ctx)
+	cviSvc, err := newCviService(ctx)
 	if err != nil {
 		log.Warnf("validatePVCDeletionForVMOwnedVolumes: failed to init CVI service for PVC %s/%s: %v; "+
 			"allowing deletion (fail-open)", pvc.Namespace, pvc.Name, err)
@@ -118,13 +137,19 @@ func validatePVCDeletionForVMOwnedVolumes(
 		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 
-	if cvi == nil || cvi.Status.Ownership != csivolumeinfov1alpha1.OwnershipStateVMManaged {
+	if cvi == nil {
+		return &admissionv1.AdmissionResponse{Allowed: true}
+	}
+	vmManaged := cvi.Status.Ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged
+	attached := len(cvi.Spec.VMs) > 0
+	if !vmManaged && !attached {
 		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 
-	// Volume is VM-managed — reject the deletion.
+	// Volume is VM-managed, or still has an attached (independent) VM — reject the deletion.
 	log.Infof("validatePVCDeletionForVMOwnedVolumes: rejecting delete of PVC %s/%s "+
-		"(volumeID=%q, ownership=VMManaged)", pvc.Namespace, pvc.Name, volumeID)
+		"(volumeID=%q, ownership=%q, attachedVMs=%d)", pvc.Namespace, pvc.Name, volumeID,
+		cvi.Status.Ownership, len(cvi.Spec.VMs))
 	msg := fmt.Sprintf(DeleteVMOwnedVolumeErrorMessageFormat, pvc.Name)
 	return &admissionv1.AdmissionResponse{
 		Allowed: false,
@@ -202,7 +227,7 @@ func validateSnapshotCreateForVMOwnedVolumes(
 		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 
-	cviSvc, err := csivolumeinfosvc.InitCsiVolumeInfoService(ctx)
+	cviSvc, err := newCviService(ctx)
 	if err != nil {
 		log.Warnf("validateSnapshotCreateForVMOwnedVolumes: failed to init CVI service for PVC %s/%s: %v; "+
 			"allowing (fail-open)", pvcNamespace, pvcName, err)
@@ -223,6 +248,61 @@ func validateSnapshotCreateForVMOwnedVolumes(
 	log.Infof("validateSnapshotCreateForVMOwnedVolumes: rejecting VolumeSnapshot %s/%s for PVC %s/%s "+
 		"(volumeID=%q, ownership=VMManaged)", req.Namespace, vs.Name, pvcNamespace, pvcName, volumeID)
 	msg := fmt.Sprintf(SnapshotVMOwnedVolumeErrorMessageFormat, pvcName)
+	return &admissionv1.AdmissionResponse{
+		Allowed: false,
+		Result: &metav1.Status{
+			Message: msg,
+			Reason:  metav1.StatusReasonForbidden,
+			Code:    403,
+		},
+	}
+}
+
+// hasMixedDiskModes reports whether vms contains both a Persistent
+// (dependent — including the empty-defaults-to-Persistent case) entry and an
+// Independent* entry. A volume has one physical form, so mixing the two
+// classes across VMs attaching the same volume is unsupported.
+func hasMixedDiskModes(vms []csivolumeinfov1alpha1.VirtualMachineRef) bool {
+	hasDependent, hasIndependent := false, false
+	for _, vm := range vms {
+		if vm.DiskMode == "" || vm.DiskMode == csivolumeinfov1alpha1.DiskModePersistent {
+			hasDependent = true
+		} else {
+			hasIndependent = true
+		}
+	}
+	return hasDependent && hasIndependent
+}
+
+// validateCsiVolumeInfoSingleMode rejects a CsiVolumeInfo CREATE/UPDATE whose
+// spec.vms mixes a Persistent entry with an Independent* entry. This
+// intercepts vm-operator's own writes to the CVI, so fails open on a decode
+// error exactly as every other handler in this file does — a bug here must
+// not block all attach progress.
+func validateCsiVolumeInfoSingleMode(
+	ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	log := logger.GetLogger(ctx)
+
+	if !featureGateVMOwnedVolumesEnabled {
+		return &admissionv1.AdmissionResponse{Allowed: true}
+	}
+	if req.Operation != admissionv1.Create && req.Operation != admissionv1.Update {
+		return &admissionv1.AdmissionResponse{Allowed: true}
+	}
+
+	cvi := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	if err := json.Unmarshal(req.Object.Raw, cvi); err != nil {
+		log.Warnf("validateCsiVolumeInfoSingleMode: failed to decode CsiVolumeInfo: %v; allowing (fail-open)", err)
+		return &admissionv1.AdmissionResponse{Allowed: true}
+	}
+
+	if !hasMixedDiskModes(cvi.Spec.VMs) {
+		return &admissionv1.AdmissionResponse{Allowed: true}
+	}
+
+	log.Infof("validateCsiVolumeInfoSingleMode: rejecting CsiVolumeInfo %s: spec.vms mixes dependent and "+
+		"independent entries", cvi.Name)
+	msg := fmt.Sprintf(MixedDiskModeErrorMessageFormat, cvi.Name)
 	return &admissionv1.AdmissionResponse{
 		Allowed: false,
 		Result: &metav1.Status{

@@ -311,6 +311,26 @@ func (r *ReconcileCnsRegisterVolume) Reconcile(ctx context.Context,
 		setInstanceError(ctx, r, instance, err.Error())
 		return reconcile.Result{RequeueAfter: timeout}, nil
 	}
+
+	// Refuse to register an existing FCD that a CsiVolumeInfo reports as
+	// VM-managed. Surfaced as an instance error, not a silent skip, because a
+	// clean-migrated dependent disk (a plain VMDK with a real bound PVC) is by
+	// hardware shape indistinguishable from a genuinely unmanaged classic
+	// disk, and migration creates that ambiguous shape in bulk.
+	if instance.Spec.VolumeID != "" && r.csiVolumeInfoService != nil {
+		cvi, cviErr := r.csiVolumeInfoService.GetCsiVolumeInfo(ctx, instance.Spec.VolumeID)
+		if cviErr != nil {
+			log.Warnf("Failed to get CsiVolumeInfo for volume %q: %v; proceeding with registration",
+				instance.Spec.VolumeID, cviErr)
+		} else if cvi != nil && cvi.Status.Ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged {
+			msg := fmt.Sprintf("volume %q is VM-managed; register requests are not permitted for VM-owned volumes",
+				instance.Spec.VolumeID)
+			log.Error(msg)
+			setInstanceError(ctx, r, instance, msg)
+			return reconcile.Result{RequeueAfter: timeout}, nil
+		}
+	}
+
 	// Verify if CnsRegisterVolume request is for block volume registration
 	// Currently file volume registration is not supported.
 	ok := isBlockVolumeRegisterRequest(ctx, instance)
@@ -577,7 +597,8 @@ func (r *ReconcileCnsRegisterVolume) Reconcile(ctx context.Context,
 	// Check if PVC already exists and has valid DataSourceRef
 	// Do this check before creating a PV. Otherwise, PVC will be bound to PV after PV
 	// is created even if validation fails
-	pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, instance.Spec.PvcName, instance.Namespace)
+	pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, r.csiVolumeInfoService,
+		instance.Spec.PvcName, instance.Namespace)
 	if err != nil {
 		log.Errorf("Failed to check existing PVC %s/%s with DataSourceRef: %+v", instance.Namespace,
 			instance.Spec.PvcName, err)
@@ -1070,8 +1091,17 @@ func isTopologyCompatible(pvcTopologySegments, volumeTopologySegments []map[stri
 // Returns the PVC if it exists with no DataSourceRef or it exists with a supported DataSourceRef.
 // If PVC exists but has an unsupported DataSourceRef, return (nil, error).
 // If PVC does not exist, return (nil, nil) so that it will be created later.
+//
+// cviSvc may be nil (VMOwnedVolumes disabled, or a caller that doesn't need
+// this check); when non-nil, a PVC already bound to a volume tracked by a
+// CsiVolumeInfo is treated as already-managed and refused outright, rather
+// than being folded into the DataSourceRef reuse logic below — a
+// clean-migrated dependent disk is a plain VMDK with a real bound PVC,
+// indistinguishable by hardware shape from a genuinely unmanaged classic
+// disk, and this placeholder-PVC path must not mutate the immutable spec of
+// a PVC that CSI or a user provisioned.
 func checkExistingPVCDataSourceRef(ctx context.Context, k8sclient clientset.Interface,
-	pvcName, namespace string) (*v1.PersistentVolumeClaim, error) {
+	cviSvc csivolumeinfosvc.CsiVolumeInfoService, pvcName, namespace string) (*v1.PersistentVolumeClaim, error) {
 	log := logger.GetLogger(ctx)
 
 	// Try to get the existing PVC
@@ -1083,6 +1113,24 @@ func checkExistingPVCDataSourceRef(ctx context.Context, k8sclient clientset.Inte
 		}
 		// Some other error occurred
 		return nil, fmt.Errorf("failed to check existing PVC %s in namespace %s: %+v", pvcName, namespace, err)
+	}
+
+	if cviSvc != nil && existingPVC.Spec.VolumeName != "" {
+		pv, pvErr := k8sclient.CoreV1().PersistentVolumes().Get(ctx, existingPVC.Spec.VolumeName, metav1.GetOptions{})
+		if pvErr != nil && !apierrors.IsNotFound(pvErr) {
+			log.Warnf("checkExistingPVCDataSourceRef: failed to get PV %q for PVC %s/%s: %v; "+
+				"proceeding without the CVI check", existingPVC.Spec.VolumeName, namespace, pvcName, pvErr)
+		} else if pvErr == nil && pv.Spec.CSI != nil && pv.Spec.CSI.VolumeHandle != "" {
+			cvi, cviErr := cviSvc.GetCsiVolumeInfo(ctx, pv.Spec.CSI.VolumeHandle)
+			if cviErr != nil {
+				log.Warnf("checkExistingPVCDataSourceRef: failed to get CsiVolumeInfo for volume %q: %v; "+
+					"proceeding without the CVI check", pv.Spec.CSI.VolumeHandle, cviErr)
+			} else if cvi != nil {
+				return nil, fmt.Errorf("existing PVC %s in namespace %s is already tracked by CsiVolumeInfo "+
+					"for volume %q; CnsRegisterVolume cannot reuse a CVI-tracked PVC",
+					pvcName, namespace, pv.Spec.CSI.VolumeHandle)
+			}
+		}
 	}
 
 	// PVC exists, check if it has DataSourceRef

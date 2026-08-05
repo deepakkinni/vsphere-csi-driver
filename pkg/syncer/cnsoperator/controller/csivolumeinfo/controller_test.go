@@ -871,6 +871,59 @@ func TestReconcile_IndependentOnlyIsIdleForOwnership(t *testing.T) {
 		"an independent-only volume must stay CSIManaged")
 }
 
+// TestReconcile_MixedDiskModesFailsLegibly verifies the reconciler-side
+// single-mode invariant guard (defense in depth for a webhook outage): a
+// spec.vms mixing a Persistent entry with an Independent* entry sets
+// phase=Failed with a named error rather than guessing which behavior
+// applies, and never calls UnregisterVolumeEx or CreateVolume.
+func TestReconcile_MixedDiskModesFailsLegibly(t *testing.T) {
+	const volID = "vol-mixed-modes"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+		{VMName: "vm-b", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled, createCalled := false, false
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, unregisterCalled, "a mixed-mode CVI must not attempt an ownership transfer")
+	assert.False(t, createCalled, "a mixed-mode CVI must not attempt a release")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseFailed, updated.Status.Phase)
+	assert.NotEmpty(t, updated.Status.Error)
+}
+
 // TestReconcile_FcdRetainedStillInfeasibleSkipsAttempt verifies that when the
 // feasibility query still reports the volume infeasible, attemptConvergence
 // does not bother re-attempting the unregister (a doomed attempt and a task

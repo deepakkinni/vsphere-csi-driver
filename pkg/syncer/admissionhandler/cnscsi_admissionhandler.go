@@ -279,6 +279,11 @@ func (h *CSISupervisorWebhook) Handle(ctx context.Context, req admission.Request
 			admissionResp := validateSnapshotOperationSupervisorRequest(ctx, &req.AdmissionRequest)
 			resp.AdmissionResponse = *admissionResp.DeepCopy()
 		}
+	} else if req.Kind.Kind == "CsiVolumeInfo" {
+		if featureGateVMOwnedVolumesEnabled {
+			admissionResp := validateCsiVolumeInfoSingleMode(ctx, &req.AdmissionRequest)
+			resp.AdmissionResponse = *admissionResp.DeepCopy()
+		}
 	}
 	return
 }

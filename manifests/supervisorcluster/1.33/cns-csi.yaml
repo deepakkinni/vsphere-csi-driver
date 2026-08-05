@@ -744,6 +744,11 @@ webhooks:
         operations: ["CREATE", "DELETE"]
         resources:   ["cnsfileaccessconfigs"]
         scope:       "Namespaced"
+      - apiGroups:   ["cns.vmware.com"]
+        apiVersions: ["v1alpha1"]
+        operations:  ["CREATE", "UPDATE"]
+        resources:   ["csivolumeinfos"]
+        scope:       "Namespaced"
     sideEffects: None
     admissionReviewVersions: ["v1"]
     failurePolicy: Fail

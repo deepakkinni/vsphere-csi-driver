@@ -61,23 +61,51 @@ func buildTestCVI(volumeID string,
 	return cvi
 }
 
-func TestRejectSnapshotIfVMManaged_VMManaged_Rejects(t *testing.T) {
+func TestAssertNotVMManaged_VMManaged_Rejects(t *testing.T) {
 	svc := cviSvcWith(buildTestCVI("vol-001", csivolumeinfov1alpha1.OwnershipStateVMManaged))
-	if err := rejectSnapshotIfVMManaged(context.Background(), svc, "vol-001"); err == nil {
+	if err := assertNotVMManaged(context.Background(), svc, "vol-001", "snapshot creation"); err == nil {
 		t.Fatal("expected error for VMManaged volume, got nil")
 	}
 }
 
-func TestRejectSnapshotIfVMManaged_CSIManaged_Allows(t *testing.T) {
+func TestAssertNotVMManaged_CSIManaged_Allows(t *testing.T) {
 	svc := cviSvcWith(buildTestCVI("vol-002", csivolumeinfov1alpha1.OwnershipStateCSIManaged))
-	if err := rejectSnapshotIfVMManaged(context.Background(), svc, "vol-002"); err != nil {
+	if err := assertNotVMManaged(context.Background(), svc, "vol-002", "snapshot creation"); err != nil {
 		t.Fatalf("expected nil for CSIManaged volume, got: %v", err)
 	}
 }
 
-func TestRejectSnapshotIfVMManaged_NoCVI_Allows(t *testing.T) {
+func TestAssertNotVMManaged_NoCVI_Allows(t *testing.T) {
 	svc := cviSvcWith() // empty
-	if err := rejectSnapshotIfVMManaged(context.Background(), svc, "vol-003"); err != nil {
+	if err := assertNotVMManaged(context.Background(), svc, "vol-003", "snapshot creation"); err != nil {
 		t.Fatalf("expected nil (fail-open) when no CVI, got: %v", err)
+	}
+}
+
+// TestAssertNotVMManaged_FcdRetained_Rejects verifies that a retained-FCD
+// volume is refused for the same reason a plain VMDK is: the CVI, not CNS
+// state, is authoritative — an fcd-retained volume still has a live FCD and
+// CNS DB row, so a CNS-side check alone would answer normally instead of
+// reporting the volume as absent.
+func TestAssertNotVMManaged_FcdRetained_Rejects(t *testing.T) {
+	cvi := buildTestCVI("vol-004", csivolumeinfov1alpha1.OwnershipStateVMManaged)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+	svc := cviSvcWith(cvi)
+	if err := assertNotVMManaged(context.Background(), svc, "vol-004", "volume deletion"); err == nil {
+		t.Fatal("expected error for fcd-retained volume, got nil")
+	}
+}
+
+// TestAssertNotVMManaged_IndependentOnly_Allows verifies attach/detach §13.3's
+// explicit carve-out: an independent attachment is CSIManaged for life and
+// is not locked down, unlike a dependent (VMManaged) one.
+func TestAssertNotVMManaged_IndependentOnly_Allows(t *testing.T) {
+	cvi := buildTestCVI("vol-005", csivolumeinfov1alpha1.OwnershipStateCSIManaged)
+	cvi.Spec.VMs = []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	svc := cviSvcWith(cvi)
+	if err := assertNotVMManaged(context.Background(), svc, "vol-005", "snapshot creation"); err != nil {
+		t.Fatalf("expected nil for an independent-only attachment, got: %v", err)
 	}
 }
