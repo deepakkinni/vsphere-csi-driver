@@ -207,6 +207,10 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 	// Ensure the PV ownerRef is present. This is idempotent and repairs CVIs
 	// created before this logic existed (existing CVIs are reconciled on startup
 	// via synthetic Create events from the informer cache sync).
+	//
+	// The CVI is created before the PV exists (wcp/controller.go createBlockVolume),
+	// so an error+requeue here on the first few reconciles is expected steady-state
+	// while the PV catches up, not a defect.
 	if err := r.ensurePVOwnerRef(ctx, cvi); err != nil {
 		log.Errorf("Reconcile: failed to ensure PV ownerRef for %s: %v", req.Name, err)
 		return reconcile.Result{}, err
