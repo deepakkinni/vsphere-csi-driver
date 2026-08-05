@@ -252,13 +252,19 @@ func (m *MockVolumeManager) ReRegisterVolume(ctx context.Context, volumeID strin
 }
 
 // UnregisterVolumeEx is a stub implementation of the CNS unregister call.
-func (m *MockVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, error) {
-	return "", "", nil
+func (m *MockVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, string, error) {
+	return "", "", "", nil
 }
 
 // QueryLiveDiskPath is a stub implementation of the live disk-path read.
 func (m *MockVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
 	return "", nil
+}
+
+// QueryUnregisterFeasibility is a stub implementation of the feasibility query.
+func (m *MockVolumeManager) QueryUnregisterFeasibility(ctx context.Context,
+	volumeIDs []string) ([]cnsvolume.UnregisterFeasibility, error) {
+	return nil, nil
 }
 
 // GetDiskFolderURL is a stub implementation.

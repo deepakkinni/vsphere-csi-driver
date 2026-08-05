@@ -182,17 +182,36 @@ type Manager interface {
 	QueryFCDChangedBlocks(ctx context.Context, volumeID, targetSnapshotID, baseChangeID string,
 		startingOffset uint64) ([]DiskArea, uint64, error)
 	// UnregisterVolumeEx unregisters the FCD from CNS in a single best-effort call
-	// and returns the backing-disk path and disk UUID from the result.
-	UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, error)
+	// and returns the backing-disk path and disk UUID from the result. On fault,
+	// the returned faultType lets the caller classify the failure without
+	// string-matching the error.
+	UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, string, error)
 	// QueryLiveDiskPath returns the volume's current backing disk path read live
 	// from the host. CNS fronts a RetrieveVStorageObject call, so the returned
 	// path is the FCD's running point (chain tip) and is authoritative even
 	// immediately after a storage vMotion, which a cached read can lag.
 	QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error)
+	// QueryUnregisterFeasibility evaluates, per volume and without side effects,
+	// whether an in-place unregister would currently succeed, and which
+	// preconditions block it if not. Results are returned in request order. A
+	// true result is a snapshot taken at evaluation time, not a guarantee: the
+	// unregister must still fail safely.
+	QueryUnregisterFeasibility(ctx context.Context, volumeIDs []string) ([]UnregisterFeasibility, error)
 	// GetDiskFolderURL converts a datastore path in "[dsName] relPath" format to
 	// the HTTP folder URL format (https://host/folder/relPath?dcPath=...&dsName=...)
 	// required by CNS's RegisterVMDKWithUrlAction for re-registration after UnregisterVolumeEx.
 	GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error)
+}
+
+// UnregisterFeasibility is one volume's evaluation from
+// CnsQueryUnregisterFeasibility. Blockers is empty iff Feasible is true.
+// EvaluationFault is set when this volume could not be evaluated; the batch
+// itself still succeeds, so callers must check it per volume.
+type UnregisterFeasibility struct {
+	VolumeID        string
+	Feasible        bool
+	Blockers        []cnstypes.CnsUnregisterBlocker
+	EvaluationFault string
 }
 
 // CnsVolumeInfo hold information related to volume created by CNS.
@@ -4506,69 +4525,157 @@ func TranslateVslmError(ctx context.Context, err error) error {
 }
 
 // UnregisterVolumeEx unregisters the FCD from CNS in a single best-effort call
-// and returns the backing-disk path and disk UUID from the result.
-func (m *defaultManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, error) {
+// and returns the backing-disk path and disk UUID from the result. On fault,
+// the returned faultType lets the caller classify the failure (e.g. via
+// QueryUnregisterFeasibility) without string-matching the error.
+//
+// A fault of vim.fault.NotFound or CnsNotRegisteredFault is treated as
+// success with an empty path and UUID: the volume has already left CNS
+// inventory, which is the documented idempotent outcome of re-issuing this
+// call on an already-unregistered volume. Callers must not overwrite an
+// already-captured disk path with these empty values.
+func (m *defaultManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, string, error) {
 	log := logger.GetLogger(ctx).With("volumeID", volumeID)
 	log.Infof("UnregisterVolumeEx: entry volumeID=%q", volumeID)
 
 	if m.virtualCenter == nil {
-		return "", "", errors.New("virtual center connection not established")
+		return "", "", "", errors.New("virtual center connection not established")
 	}
 	if err := m.virtualCenter.ConnectCns(ctx); err != nil {
 		log.Errorf("UnregisterVolumeEx: ConnectCns failed for volumeID=%q: %v", volumeID, err)
-		return "", "", fmt.Errorf("connecting to CNS failed: %w", err)
+		return "", "", "", fmt.Errorf("connecting to CNS failed: %w", err)
 	}
 
 	spec := []cnstypes.CnsUnregisterVolumeSpec{
 		{
 			VolumeId:         cnstypes.CnsVolumeId{Id: volumeID},
-			TargetVolumeType: string(cnstypes.CnsUnregisterTargetVolumeTypeFCD),
+			TargetVolumeType: string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK),
 		},
 	}
 	task, err := m.virtualCenter.CnsClient.UnregisterVolumeEx(ctx, spec)
 	if err != nil {
 		log.Errorf("UnregisterVolumeEx: CNS call failed for volumeID=%q: %v", volumeID, err)
-		return "", "", fmt.Errorf("CnsUnregisterVolumeEx failed: %w", err)
+		return "", "", "", fmt.Errorf("CnsUnregisterVolumeEx failed: %w", err)
 	}
 
 	taskInfo, err := m.waitOnTask(ctx, task.Reference())
 	if err != nil {
 		log.Errorf("UnregisterVolumeEx: waitOnTask failed for volumeID=%q: %v", volumeID, err)
-		return "", "", fmt.Errorf("waiting for CnsUnregisterVolumeEx task failed: %w", err)
+		return "", "", "", fmt.Errorf("waiting for CnsUnregisterVolumeEx task failed: %w", err)
 	}
 	if taskInfo == nil {
 		log.Errorf("UnregisterVolumeEx: taskInfo is nil for volumeID=%q", volumeID)
-		return "", "", errors.New("taskInfo is nil for CnsUnregisterVolumeEx task")
+		return "", "", "", errors.New("taskInfo is nil for CnsUnregisterVolumeEx task")
 	}
 
 	res, err := getTaskResultFromTaskInfo(ctx, taskInfo)
 	if err != nil {
 		log.Errorf("UnregisterVolumeEx: failed to get task result for volumeID=%q: %v", volumeID, err)
-		return "", "", fmt.Errorf("failed to get CnsUnregisterVolumeEx task result: %w", err)
+		return "", "", "", fmt.Errorf("failed to get CnsUnregisterVolumeEx task result: %w", err)
 	}
 	if res == nil {
 		log.Errorf("UnregisterVolumeEx: task result is nil for volumeID=%q opId=%q",
 			volumeID, taskInfo.ActivationId)
-		return "", "", errors.New("task result is nil for CnsUnregisterVolumeEx task")
+		return "", "", "", errors.New("task result is nil for CnsUnregisterVolumeEx task")
 	}
 
 	unregRes, ok := res.(*cnstypes.CnsUnregisterVolumeResult)
 	if !ok {
 		log.Errorf("UnregisterVolumeEx: unexpected result type %T for volumeID=%q", res, volumeID)
-		return "", "", fmt.Errorf("unexpected task result type %T for CnsUnregisterVolumeEx", res)
+		return "", "", "", fmt.Errorf("unexpected task result type %T for CnsUnregisterVolumeEx", res)
 	}
 
 	volOpRes := unregRes.GetCnsVolumeOperationResult()
 	if volOpRes.Fault != nil {
-		fault := ExtractFaultTypeFromVolumeResponseResult(ctx, volOpRes)
+		faultType := ExtractFaultTypeFromVolumeResponseResult(ctx, volOpRes)
+		if faultType == csifault.VimFaultNotFound || IsCnsNotRegisteredFault(ctx, volOpRes.Fault) {
+			log.Infof("UnregisterVolumeEx: volumeID=%q already unregistered (fault=%q); treating as success",
+				volumeID, faultType)
+			return "", "", "", nil
+		}
 		log.Errorf("UnregisterVolumeEx: fault for volumeID=%q fault=%q opId=%q",
-			volumeID, fault, taskInfo.ActivationId)
-		return "", "", fmt.Errorf("CnsUnregisterVolumeEx fault: %s", fault)
+			volumeID, faultType, taskInfo.ActivationId)
+		return "", "", faultType, fmt.Errorf("CnsUnregisterVolumeEx fault: %s", faultType)
 	}
 
 	log.Infof("UnregisterVolumeEx: exit volumeID=%q backingDiskPath=%q diskUUID=%q opId=%q",
 		volumeID, unregRes.BackingDiskPath, unregRes.DiskUUID, taskInfo.ActivationId)
-	return unregRes.BackingDiskPath, unregRes.DiskUUID, nil
+	return unregRes.BackingDiskPath, unregRes.DiskUUID, "", nil
+}
+
+// QueryUnregisterFeasibility evaluates, per volume and without side effects,
+// whether an in-place unregister would currently succeed, and which
+// preconditions block it if not. Results are returned in request order. A
+// true result is a snapshot taken at evaluation time, not a guarantee: the
+// unregister must still fail safely.
+//
+// A per-volume evaluation failure is reported on that volume's
+// EvaluationFault rather than failing the whole call — the API is
+// deliberately partial-failure tolerant.
+func (m *defaultManager) QueryUnregisterFeasibility(ctx context.Context,
+	volumeIDs []string) ([]UnregisterFeasibility, error) {
+	log := logger.GetLogger(ctx)
+	log.Infof("QueryUnregisterFeasibility: entry volumeIDs=%v", volumeIDs)
+
+	if m.virtualCenter == nil {
+		return nil, errors.New("virtual center connection not established")
+	}
+	if err := m.virtualCenter.ConnectCns(ctx); err != nil {
+		log.Errorf("QueryUnregisterFeasibility: ConnectCns failed: %v", err)
+		return nil, fmt.Errorf("connecting to CNS failed: %w", err)
+	}
+
+	cnsVolumeIDs := make([]cnstypes.CnsVolumeId, 0, len(volumeIDs))
+	for _, id := range volumeIDs {
+		cnsVolumeIDs = append(cnsVolumeIDs, cnstypes.CnsVolumeId{Id: id})
+	}
+
+	task, err := m.virtualCenter.CnsClient.QueryUnregisterFeasibility(
+		ctx, cnsVolumeIDs, string(cnstypes.CnsUnregisterTargetVolumeTypeLEGACY_DISK))
+	if err != nil {
+		log.Errorf("QueryUnregisterFeasibility: CNS call failed for volumeIDs=%v: %v", volumeIDs, err)
+		return nil, fmt.Errorf("CnsQueryUnregisterFeasibility failed: %w", err)
+	}
+
+	taskInfo, err := m.waitOnTask(ctx, task.Reference())
+	if err != nil {
+		log.Errorf("QueryUnregisterFeasibility: waitOnTask failed for volumeIDs=%v: %v", volumeIDs, err)
+		return nil, fmt.Errorf("waiting for CnsQueryUnregisterFeasibility task failed: %w", err)
+	}
+	if taskInfo == nil {
+		log.Errorf("QueryUnregisterFeasibility: taskInfo is nil for volumeIDs=%v", volumeIDs)
+		return nil, errors.New("taskInfo is nil for CnsQueryUnregisterFeasibility task")
+	}
+
+	taskResults, err := cns.GetTaskResultArray(ctx, taskInfo)
+	if err != nil {
+		log.Errorf("QueryUnregisterFeasibility: failed to get task results for volumeIDs=%v: %v", volumeIDs, err)
+		return nil, fmt.Errorf("failed to get CnsQueryUnregisterFeasibility task results: %w", err)
+	}
+
+	feasibilities := make([]UnregisterFeasibility, 0, len(taskResults))
+	for _, res := range taskResults {
+		feasibilityRes, ok := res.(*cnstypes.CnsUnregisterFeasibilityResult)
+		if !ok {
+			log.Errorf("QueryUnregisterFeasibility: unexpected result type %T", res)
+			return nil, fmt.Errorf("unexpected task result type %T for CnsQueryUnregisterFeasibility", res)
+		}
+		volOpRes := feasibilityRes.GetCnsVolumeOperationResult()
+		f := UnregisterFeasibility{
+			VolumeID: volOpRes.VolumeId.Id,
+			Feasible: feasibilityRes.Feasible,
+			Blockers: feasibilityRes.Blockers,
+		}
+		if volOpRes.Fault != nil {
+			f.EvaluationFault = ExtractFaultTypeFromVolumeResponseResult(ctx, volOpRes)
+			log.Warnf("QueryUnregisterFeasibility: evaluation fault for volumeID=%q fault=%q opId=%q",
+				f.VolumeID, f.EvaluationFault, taskInfo.ActivationId)
+		}
+		feasibilities = append(feasibilities, f)
+	}
+
+	log.Infof("QueryUnregisterFeasibility: exit volumeIDs=%v opId=%q", volumeIDs, taskInfo.ActivationId)
+	return feasibilities, nil
 }
 
 // QueryLiveDiskPath returns the volume's current backing disk path read live

@@ -19,7 +19,9 @@ package csivolumeinfo
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +62,7 @@ const (
 	reasonRegisterSucceeded   = "RegisterSucceeded"
 	reasonReconcileFailed     = "ReconcileFailed"
 	reasonInitialCSIManaged   = "InitialCSIManaged"
+	reasonFcdRetained         = "FcdRetained"
 )
 
 var (
@@ -168,6 +171,16 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 	case vmCount > 0 && (ownership == "" || ownership == csivolumeinfov1alpha1.OwnershipStateCSIManaged):
 		log.Infof("Reconcile: %d VM(s) attached, ownership=%q → reconcileUnregister", vmCount, ownership)
 		if err := r.reconcileUnregister(ctx, cvi); err != nil {
+			var transientErr *transientUnregisterBlockError
+			if errors.As(err, &transientErr) {
+				// A transient blocker (e.g. an unreachable host) is not a
+				// failure: the volume is untouched, so status is left alone
+				// and only the backoff advances.
+				log.Infof("Reconcile: unregister deferred by a transient blocker for %s; "+
+					"requeueing without a status change: %v", req.Name, err)
+				doubleBackoffDuration(ctx, nn)
+				return reconcile.Result{RequeueAfter: backoff}, nil
+			}
 			log.Errorf("Reconcile: reconcileUnregister failed: %v", err)
 			if statusErr := r.setFailedStatus(ctx, cvi, err.Error()); statusErr != nil {
 				log.Warnf("Reconcile: could not write failed status: %v", statusErr)
@@ -196,7 +209,7 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 		patch := buildStatusPatch(cvi.Generation,
 			csivolumeinfov1alpha1.OwnershipStateCSIManaged,
 			csivolumeinfov1alpha1.PhaseSucceeded,
-			"", reasonInitialCSIManaged, true)
+			"", "", reasonInitialCSIManaged, true)
 		if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, patch); err != nil {
 			log.Errorf("Reconcile: failed to set initial CSIManaged status: %v", err)
 			return reconcile.Result{}, err
@@ -208,6 +221,171 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 
 	log.Infof("Reconcile: exit for CsiVolumeInfo %s", req.Name)
 	return reconcile.Result{}, nil
+}
+
+// disposition is the severity of an unregister blocker, ordered
+// Permanent > Structural > Transient.
+type disposition int
+
+const (
+	dispositionTransient disposition = iota
+	dispositionStructural
+	dispositionPermanent
+)
+
+func (d disposition) String() string {
+	switch d {
+	case dispositionPermanent:
+		return "PERMANENT"
+	case dispositionStructural:
+		return "STRUCTURAL"
+	default:
+		return "TRANSIENT"
+	}
+}
+
+// worstDisposition returns the most severe disposition among the reported
+// blockers, using the ordering Permanent > Structural > Transient.
+//
+// Two defaults are load-bearing. An unrecognized disposition is treated as
+// Structural: deferring an unfamiliar blocker is safe, retrying one forever
+// is not. An empty blocker list is treated as Transient: either the blocker
+// cleared between the attempt and the query, or the fault was unrelated to
+// feasibility. (A feasibility query that itself could not be evaluated is a
+// separate case, handled by the caller before this function is reached.)
+func worstDisposition(blockers []cnstypes.CnsUnregisterBlocker) disposition {
+	worst := dispositionTransient
+	for _, b := range blockers {
+		var d disposition
+		switch b.Disposition {
+		case cnstypes.CnsUnregisterBlockerDispositionPermanent:
+			d = dispositionPermanent
+		case cnstypes.CnsUnregisterBlockerDispositionTransient:
+			d = dispositionTransient
+		default: // CnsUnregisterBlockerDispositionStructural and any unrecognized value.
+			d = dispositionStructural
+		}
+		if d > worst {
+			worst = d
+		}
+	}
+	return worst
+}
+
+// blockerMessage renders the blockers reported by the feasibility query into
+// a status condition message naming the blocking condition, so a CBT block
+// can be told apart from a snapshot block without resorting to logs.
+func blockerMessage(blockers []cnstypes.CnsUnregisterBlocker) string {
+	if len(blockers) == 0 {
+		return "unregister blocked; blocker detail unavailable"
+	}
+	parts := make([]string, 0, len(blockers))
+	for _, b := range blockers {
+		if b.Detail != "" {
+			parts = append(parts, fmt.Sprintf("%s: %s", b.Condition, b.Detail))
+		} else {
+			parts = append(parts, b.Condition)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// transientUnregisterBlockError signals that an unregister attempt was
+// blocked by a transient precondition (e.g. an unreachable host). The volume
+// is neither VMManaged nor Failed; Reconcile requeues with backoff and leaves
+// status untouched, because nothing about the volume has actually failed.
+type transientUnregisterBlockError struct {
+	cause error
+}
+
+func (e *transientUnregisterBlockError) Error() string { return e.cause.Error() }
+func (e *transientUnregisterBlockError) Unwrap() error { return e.cause }
+
+// handleUnregisterBlocked classifies a failed UnregisterVolumeEx attempt via
+// the feasibility query and either defers the volume as fcd-retained
+// (Permanent or Structural) or signals a transient block to the caller for a
+// backoff-only retry. patchedGen is the generation from the live-path patch
+// already applied earlier in reconcileUnregister; a Permanent/Structural
+// defer reuses it because the fcd-retained annotation patch that precedes the
+// status write is metadata-only and does not advance generation.
+func (r *Reconciler) handleUnregisterBlocked(ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo,
+	patchedGen int64, faultType string, unregErr error) error {
+	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+	log.Warnf("reconcileUnregister: UnregisterVolumeEx blocked for volume %q (fault=%q): %v",
+		cvi.Spec.VolumeID, faultType, unregErr)
+
+	log.Infof("reconcileUnregister: calling QueryUnregisterFeasibility for volume %q", cvi.Spec.VolumeID)
+	feasibilities, err := r.volumeManager.QueryUnregisterFeasibility(ctx, []string{cvi.Spec.VolumeID})
+
+	var disp disposition
+	var blockers []cnstypes.CnsUnregisterBlocker
+	switch {
+	case err != nil:
+		log.Warnf("reconcileUnregister: QueryUnregisterFeasibility call failed for volume %q; "+
+			"treating as structural: %v", cvi.Spec.VolumeID, err)
+		disp = dispositionStructural
+	case len(feasibilities) != 1:
+		log.Warnf("reconcileUnregister: QueryUnregisterFeasibility returned %d results for volume %q, "+
+			"expected 1; treating as structural", len(feasibilities), cvi.Spec.VolumeID)
+		disp = dispositionStructural
+	case feasibilities[0].EvaluationFault != "":
+		log.Warnf("reconcileUnregister: QueryUnregisterFeasibility could not evaluate volume %q "+
+			"(fault=%q); treating as structural", cvi.Spec.VolumeID, feasibilities[0].EvaluationFault)
+		disp = dispositionStructural
+	default:
+		blockers = feasibilities[0].Blockers
+		disp = worstDisposition(blockers)
+	}
+	log.Infof("reconcileUnregister: worst disposition for volume %q is %s (blockers=%d)",
+		cvi.Spec.VolumeID, disp, len(blockers))
+
+	if disp == dispositionTransient {
+		log.Infof("reconcileUnregister: transient block for volume %q; deferring to backoff "+
+			"without a status change", cvi.Spec.VolumeID)
+		return &transientUnregisterBlockError{cause: unregErr}
+	}
+	return r.deferAsFcdRetained(ctx, cvi, patchedGen, blockers)
+}
+
+// deferAsFcdRetained marks the volume fcd-retained and flips it to
+// VMManaged/Succeeded — a functional, not failed, resting state. Patch
+// ordering is a correctness requirement: the fcd-retained metadata patch
+// lands before the status flip, so no observer ever sees
+// ownership=VMManaged on a retained FCD without the annotation that marks it
+// locked down.
+func (r *Reconciler) deferAsFcdRetained(ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo,
+	patchedGen int64, blockers []cnstypes.CnsUnregisterBlocker) error {
+	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+	message := blockerMessage(blockers)
+	log.Infof("reconcileUnregister: deferring volume %q as fcd-retained: %s", cvi.Spec.VolumeID, message)
+
+	annotationPatch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				csivolumeinfov1alpha1.FcdRetainedAnnotation: "true",
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("reconcileUnregister: failed to marshal fcd-retained annotation patch for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	if _, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, annotationPatch); err != nil {
+		return fmt.Errorf("reconcileUnregister: failed to patch fcd-retained annotation for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileUnregister: fcd-retained annotation set for volume %q", cvi.Spec.VolumeID)
+
+	statusPatch := buildStatusPatch(patchedGen,
+		csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		csivolumeinfov1alpha1.PhaseSucceeded, "", message, reasonFcdRetained, true)
+	if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, statusPatch); err != nil {
+		return fmt.Errorf("reconcileUnregister: failed to patch fcd-retained status for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileUnregister: status patched to VMManaged/Succeeded (FcdRetained) for volume %q",
+		cvi.Spec.VolumeID)
+	return nil
 }
 
 // reconcileUnregister captures the volume's live disk identity, then attempts
@@ -272,38 +450,49 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 	log.Infof("reconcileUnregister: volume-protection finalizer added for volume %q", cvi.Spec.VolumeID)
 
 	log.Infof("reconcileUnregister: calling UnregisterVolumeEx for volume %q", cvi.Spec.VolumeID)
-	backingDiskPath, diskUUID, err := r.volumeManager.UnregisterVolumeEx(ctx, cvi.Spec.VolumeID)
-	if err != nil {
-		return fmt.Errorf("reconcileUnregister: UnregisterVolumeEx failed for %q: %w",
-			cvi.Spec.VolumeID, err)
+	backingDiskPath, diskUUID, faultType, unregErr := r.volumeManager.UnregisterVolumeEx(ctx, cvi.Spec.VolumeID)
+	if unregErr != nil {
+		// A blocked unregister is not necessarily a failure — it may defer to
+		// fcd-retained (functional) or need a plain backoff retry (transient).
+		// Classification is handleUnregisterBlocked's job.
+		return r.handleUnregisterBlocked(ctx, cvi, patchedGen, faultType, unregErr)
 	}
 	log.Infof("reconcileUnregister: UnregisterVolumeEx succeeded — diskPath=%q, diskUUID=%q",
 		backingDiskPath, diskUUID)
 
-	// Persist diskPath and diskUUID from the unregister result; this
-	// supersedes the live path patched in step 1.
-	specPatch, err := json.Marshal(map[string]interface{}{
-		"spec": map[string]interface{}{
-			"diskPath": backingDiskPath,
-			"diskUUID": diskUUID,
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("reconcileUnregister: failed to marshal spec patch for %q: %w",
-			cvi.Spec.VolumeID, err)
+	if backingDiskPath != "" {
+		// Persist diskPath and diskUUID from the unregister result; this
+		// supersedes the live path patched in step 1.
+		specPatch, err := json.Marshal(map[string]interface{}{
+			"spec": map[string]interface{}{
+				"diskPath": backingDiskPath,
+				"diskUUID": diskUUID,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("reconcileUnregister: failed to marshal spec patch for %q: %w",
+				cvi.Spec.VolumeID, err)
+		}
+		patchedGen, err = r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, specPatch)
+		if err != nil {
+			return fmt.Errorf("reconcileUnregister: failed to patch spec for %q: %w",
+				cvi.Spec.VolumeID, err)
+		}
+		log.Infof("reconcileUnregister: patched spec.diskPath and spec.diskUUID for volume %q (generation=%d)",
+			cvi.Spec.VolumeID, patchedGen)
+	} else {
+		// An empty backingDiskPath means UnregisterVolumeEx found the volume
+		// already unregistered (the documented idempotent outcome). Keep the
+		// live-captured spec.diskPath from step 1 rather than overwriting it
+		// with an empty value.
+		log.Infof("reconcileUnregister: volume %q was already unregistered; keeping the live-captured spec.diskPath",
+			cvi.Spec.VolumeID)
 	}
-	patchedGen, err = r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, specPatch)
-	if err != nil {
-		return fmt.Errorf("reconcileUnregister: failed to patch spec for %q: %w",
-			cvi.Spec.VolumeID, err)
-	}
-	log.Infof("reconcileUnregister: patched spec.diskPath and spec.diskUUID for volume %q (generation=%d)",
-		cvi.Spec.VolumeID, patchedGen)
 
 	// Write status: ownership=VMManaged, phase=Succeeded.
 	statusPatch := buildStatusPatch(patchedGen,
 		csivolumeinfov1alpha1.OwnershipStateVMManaged,
-		csivolumeinfov1alpha1.PhaseSucceeded, "", reasonUnregisterSucceeded, true)
+		csivolumeinfov1alpha1.PhaseSucceeded, "", "", reasonUnregisterSucceeded, true)
 	if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, statusPatch); err != nil {
 		return fmt.Errorf("reconcileUnregister: failed to patch status for %q: %w",
 			cvi.Spec.VolumeID, err)
@@ -431,7 +620,7 @@ func (r *Reconciler) reconcileRegister(ctx context.Context,
 	// Patch status: ownership=CSIManaged, phase=Succeeded.
 	statusPatch := buildStatusPatch(cvi.Generation,
 		csivolumeinfov1alpha1.OwnershipStateCSIManaged,
-		csivolumeinfov1alpha1.PhaseSucceeded, "", reasonRegisterSucceeded, true)
+		csivolumeinfov1alpha1.PhaseSucceeded, "", "", reasonRegisterSucceeded, true)
 	if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, statusPatch); err != nil {
 		return fmt.Errorf("reconcileRegister: failed to patch status for %q: %w",
 			cvi.Spec.VolumeID, err)
@@ -515,14 +704,20 @@ func (r *Reconciler) setFailedStatus(ctx context.Context,
 	patch := buildStatusPatch(cvi.Generation,
 		cvi.Status.Ownership, // do not change ownership on failure
 		csivolumeinfov1alpha1.PhaseFailed,
-		errMsg, reasonReconcileFailed, false)
+		errMsg, errMsg, reasonReconcileFailed, false)
 	return r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, patch)
 }
 
 // buildStatusPatch constructs a JSON merge-patch for the status subresource.
 // It always sets observedGeneration to ensure vm-operator's wait condition is met.
+//
+// statusError and condMessage are deliberately separate: statusError populates
+// status.error and must be empty for anything short of a genuine reconcile
+// failure, while condMessage is always safe to set — a deferred fcd-retained
+// volume carries the blocker's detail on the condition message without that
+// message also being read back as status.error.
 func buildStatusPatch(generation int64, ownership csivolumeinfov1alpha1.OwnershipState,
-	phase csivolumeinfov1alpha1.PhaseState, errMsg string,
+	phase csivolumeinfov1alpha1.PhaseState, statusError, condMessage string,
 	condReason string, condReady bool) []byte {
 
 	condStatus := metav1.ConditionFalse
@@ -533,7 +728,7 @@ func buildStatusPatch(generation int64, ownership csivolumeinfov1alpha1.Ownershi
 		"type":               conditionTypeReady,
 		"status":             string(condStatus),
 		"reason":             condReason,
-		"message":            errMsg,
+		"message":            condMessage,
 		"lastTransitionTime": metav1.Now().UTC().Format(time.RFC3339),
 	}
 	statusMap := map[string]interface{}{
@@ -541,7 +736,7 @@ func buildStatusPatch(generation int64, ownership csivolumeinfov1alpha1.Ownershi
 			"ownership":          string(ownership),
 			"phase":              string(phase),
 			"observedGeneration": generation,
-			"error":              errMsg,
+			"error":              statusError,
 			"conditions":         []interface{}{cond},
 		},
 	}

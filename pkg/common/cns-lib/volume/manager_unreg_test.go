@@ -38,11 +38,12 @@ func TestMockUnregisterVolumeExSuccess(t *testing.T) {
 	ctx := context.Background()
 	m := NewMockManager(false, nil, "")
 
-	backingDiskPath, diskUUID, err := m.UnregisterVolumeEx(ctx, "test-volume-id")
+	backingDiskPath, diskUUID, faultType, err := m.UnregisterVolumeEx(ctx, "test-volume-id")
 
 	require.NoError(t, err)
 	assert.Empty(t, backingDiskPath)
 	assert.Empty(t, diskUUID)
+	assert.Empty(t, faultType)
 }
 
 // TestMockUnregisterVolumeExFailure verifies the error path of the mock.
@@ -51,10 +52,11 @@ func TestMockUnregisterVolumeExFailure(t *testing.T) {
 	sentinelErr := errors.New("cns unregister ex failed")
 	m := NewMockManager(true, sentinelErr, "vim25:SystemError")
 
-	_, _, err := m.UnregisterVolumeEx(ctx, "test-volume-id")
+	_, _, faultType, err := m.UnregisterVolumeEx(ctx, "test-volume-id")
 
 	require.Error(t, err)
 	assert.Equal(t, sentinelErr, err)
+	assert.Equal(t, "vim25:SystemError", faultType)
 }
 
 // TestMockQueryLiveDiskPathSuccess verifies the success path of the mock.
@@ -89,7 +91,7 @@ func TestDefaultManagerUnregisterVolumeExNilVC(t *testing.T) {
 	ctx := context.Background()
 	m := &defaultManager{} // virtualCenter is nil
 
-	_, _, err := m.UnregisterVolumeEx(ctx, "vol-001")
+	_, _, _, err := m.UnregisterVolumeEx(ctx, "vol-001")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "virtual center connection not established")
@@ -106,6 +108,42 @@ func TestDefaultManagerQueryLiveDiskPathNilVC(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "virtual Center connection not established")
+}
+
+// TestMockQueryUnregisterFeasibilitySuccess verifies the success path of the mock.
+func TestMockQueryUnregisterFeasibilitySuccess(t *testing.T) {
+	ctx := context.Background()
+	m := NewMockManager(false, nil, "")
+
+	feasibilities, err := m.QueryUnregisterFeasibility(ctx, []string{"test-volume-id"})
+
+	require.NoError(t, err)
+	assert.Nil(t, feasibilities)
+}
+
+// TestMockQueryUnregisterFeasibilityFailure verifies the error path of the mock.
+func TestMockQueryUnregisterFeasibilityFailure(t *testing.T) {
+	ctx := context.Background()
+	sentinelErr := errors.New("cns query unregister feasibility failed")
+	m := NewMockManager(true, sentinelErr, "vim25:SystemError")
+
+	_, err := m.QueryUnregisterFeasibility(ctx, []string{"test-volume-id"})
+
+	require.Error(t, err)
+	assert.Equal(t, sentinelErr, err)
+}
+
+// TestDefaultManagerQueryUnregisterFeasibilityNilVC verifies that
+// QueryUnregisterFeasibility returns an error immediately when the
+// virtualCenter is nil (no live VC required for this unit test path).
+func TestDefaultManagerQueryUnregisterFeasibilityNilVC(t *testing.T) {
+	ctx := context.Background()
+	m := &defaultManager{} // virtualCenter is nil
+
+	_, err := m.QueryUnregisterFeasibility(ctx, []string{"vol-001"})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "virtual center connection not established")
 }
 
 // TestUnregisterVolumeResultType verifies that the CnsUnregisterVolumeResult
