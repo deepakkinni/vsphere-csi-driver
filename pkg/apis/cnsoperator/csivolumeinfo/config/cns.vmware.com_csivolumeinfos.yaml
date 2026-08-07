@@ -93,6 +93,13 @@ spec:
                     vmName:
                       description: VMName is the VirtualMachine CR name.
                       type: string
+                    volumeName:
+                      description: |-
+                        VolumeName is vm.spec.volumes[*].name on that VM. vm-operator writes it so a
+                        detach can correlate this entry to the VM's vm.status.volumes entry — and
+                        hence to the device slot — after the volume has already been removed from
+                        vm.spec.volumes. CSI never reads it.
+                      type: string
                   required:
                   - vmName
                   type: object

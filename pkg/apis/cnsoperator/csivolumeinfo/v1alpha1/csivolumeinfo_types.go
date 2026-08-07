@@ -116,6 +116,12 @@ type VirtualMachineRef struct {
 	// matching the vm.spec default.
 	// +optional
 	DiskMode DiskMode `json:"diskMode,omitempty"`
+	// VolumeName is vm.spec.volumes[*].name on that VM. vm-operator writes it so a
+	// detach can correlate this entry to the VM's vm.status.volumes entry — and
+	// hence to the device slot — after the volume has already been removed from
+	// vm.spec.volumes. CSI never reads it.
+	// +optional
+	VolumeName string `json:"volumeName,omitempty"`
 }
 
 // CsiVolumeInfoSpec defines the desired state of CsiVolumeInfo.
