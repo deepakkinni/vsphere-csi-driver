@@ -160,10 +160,32 @@ func hasIndependentEntry(vms []csivolumeinfov1alpha1.VirtualMachineRef) bool {
 	return false
 }
 
+// hasVolumeProtectionFinalizer reports whether the CVI already carries
+// VolumeProtectionFinalizer. reconcileUnregister adds this finalizer once,
+// right before its destructive UnregisterVolumeEx call — its presence is a
+// durable, structural signal that some earlier reconcile for this same CVI
+// got at least that far, independent of the informer cache's view of
+// status.ownership (which the racing reconcile below cannot trust).
+func hasVolumeProtectionFinalizer(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool {
+	for _, f := range cvi.Finalizers {
+		if f == csivolumeinfov1alpha1.VolumeProtectionFinalizer {
+			return true
+		}
+	}
+	return false
+}
+
 // Reconcile reads the state of the CsiVolumeInfo CR and drives the volume
 // ownership state machine.  The controller is the sole writer of
 // status.ownership and status.phase; vm-operator is the sole writer of
 // spec.vms.
+//
+// Precondition: if ImportPendingAnnotation is present, the entire decision
+// table below is deferred (see the annotation's doc comment) — the
+// CnsRegisterVolume deferFcdRegistration ("import") path creates a CVI with
+// spec.vms already populated before its status is patched to VMManaged, and
+// this CR must not be mistaken for a normal new dependent attach in that
+// window (it has no backing FCD to Unregister).
 //
 // Decision table (hasDependent = any Persistent entry in spec.vms; empty ⇒ Persistent):
 //
@@ -223,6 +245,19 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 	if err := r.syncPVCUsedByAndProtection(ctx, cvi); err != nil {
 		log.Errorf("Reconcile: failed to sync PVC usedby-vm/finalizer for %s: %v", req.Name, err)
 		return reconcile.Result{}, err
+	}
+
+	// The CnsRegisterVolume deferFcdRegistration ("import") path creates a CVI
+	// with spec.vms already populated, then patches status to VMManaged in a
+	// second, separate call. In between, this CR looks identical to a normal
+	// new dependent attach (hasDependent && ownership==""), but it has no
+	// backing FCD by design — Unregister-ing it fails permanently. Defer the
+	// entire ownership state machine until the import path removes this
+	// annotation (which it only does after status is durably VMManaged).
+	if _, importPending := cvi.Annotations[csivolumeinfov1alpha1.ImportPendingAnnotation]; importPending {
+		log.Infof("Reconcile: %s has %s annotation; import in progress, deferring", req.Name,
+			csivolumeinfov1alpha1.ImportPendingAnnotation)
+		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
 
 	vmCount := len(cvi.Spec.VMs)
@@ -518,6 +553,42 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 
 	livePath, err := r.volumeManager.QueryLiveDiskPath(ctx, cvi.Spec.VolumeID)
 	if err != nil {
+		// A second, racing reconcile can land here after an earlier reconcile
+		// already ran UnregisterVolumeEx to completion on this same CVI: two
+		// spec patches below (live-path, then post-unregister) each advance
+		// metadata.generation and enqueue a fresh reconcile, and that reconcile
+		// can start, and read a client-cache snapshot of status.ownership that
+		// predates the first reconcile's own status write, before the cache
+		// observes it. That reconcile re-enters this same branch and calls
+		// QueryLiveDiskPath again — but the disk is no longer a first-class
+		// disk (FCD) to query; UnregisterVolumeEx is a one-way transition, so
+		// this is a permanent NotFound, not a transient one.
+		//
+		// VolumeProtectionFinalizer is only ever added a few lines below, once,
+		// right before that destructive call — its presence on the object we
+		// were handed is a durable signal (unlike status.ownership here, not
+		// subject to the same cache race) that some earlier reconcile for this
+		// CVI already got that far. If so, treat this failure as confirmation
+		// that unregister already succeeded rather than a genuine error, and
+		// converge straight to VMManaged/Succeeded using the diskPath/diskUUID
+		// that earlier reconcile already durably recorded on spec — no further
+		// destructive calls are needed or safe to make.
+		if hasVolumeProtectionFinalizer(cvi) {
+			log.Infof("reconcileUnregister: QueryLiveDiskPath failed for %q but the volume-protection "+
+				"finalizer is already present, implying an earlier reconcile already completed "+
+				"UnregisterVolumeEx for this volume; converging to VMManaged/Succeeded without retrying "+
+				"the destructive call: %v", cvi.Spec.VolumeID, err)
+			statusPatch := buildStatusPatch(cvi.Generation,
+				csivolumeinfov1alpha1.OwnershipStateVMManaged,
+				csivolumeinfov1alpha1.PhaseSucceeded, "", "", reasonUnregisterSucceeded, true)
+			if statusErr := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, statusPatch); statusErr != nil {
+				return fmt.Errorf("reconcileUnregister: failed to patch status for %q on "+
+					"already-unregistered convergence: %w", cvi.Spec.VolumeID, statusErr)
+			}
+			log.Infof("reconcileUnregister: status patched to VMManaged/Succeeded for volume %q "+
+				"(already-unregistered convergence)", cvi.Spec.VolumeID)
+			return nil
+		}
 		// Includes NotFound, which the manager's live query can return
 		// transiently right after a storage vMotion to a different datastore.
 		// That is retryable, not evidence the disk is gone, so the unregister
@@ -571,9 +642,19 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 	log.Infof("reconcileUnregister: UnregisterVolumeEx succeeded — diskPath=%q, diskUUID=%q",
 		backingDiskPath, diskUUID)
 
-	if backingDiskPath != "" {
+	if backingDiskPath != "" && (backingDiskPath != livePath || diskUUID != cvi.Spec.DiskUUID) {
 		// Persist diskPath and diskUUID from the unregister result; this
-		// supersedes the live path patched in step 1.
+		// supersedes the live path patched in step 1. Skipped when the result
+		// is identical to what step 1 already wrote (the common case — the
+		// disk does not move between the two calls a few hundred milliseconds
+		// apart) so this function issues only one generation-advancing spec
+		// write instead of two. Each such write enqueues a fresh reconcile for
+		// this object; halving them cuts in half how often a racing reconcile
+		// can observe a stale (pre-status-write) ownership from the client
+		// cache and re-enter this function against an already-unregistered
+		// disk — the case the QueryLiveDiskPath NotFound convergence above
+		// exists to catch, but avoiding the race in the first place is
+		// cheaper than recovering from it every time.
 		specPatch, err := json.Marshal(map[string]interface{}{
 			"spec": map[string]interface{}{
 				"diskPath": backingDiskPath,
@@ -591,13 +672,18 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 		}
 		log.Infof("reconcileUnregister: patched spec.diskPath and spec.diskUUID for volume %q (generation=%d)",
 			cvi.Spec.VolumeID, patchedGen)
-	} else {
+	} else if backingDiskPath == "" {
 		// An empty backingDiskPath means UnregisterVolumeEx found the volume
 		// already unregistered (the documented idempotent outcome). Keep the
 		// live-captured spec.diskPath from step 1 rather than overwriting it
 		// with an empty value.
 		log.Infof("reconcileUnregister: volume %q was already unregistered; keeping the live-captured spec.diskPath",
 			cvi.Spec.VolumeID)
+	} else {
+		// backingDiskPath/diskUUID are non-empty but identical to what step 1
+		// already wrote; skip the redundant spec write (see comment above).
+		log.Infof("reconcileUnregister: UnregisterVolumeEx result matches the live-captured spec.diskPath "+
+			"for volume %q; skipping redundant spec patch", cvi.Spec.VolumeID)
 	}
 
 	// Write status: ownership=VMManaged, phase=Succeeded.

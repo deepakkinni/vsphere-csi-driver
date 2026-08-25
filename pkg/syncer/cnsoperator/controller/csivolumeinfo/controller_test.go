@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -585,6 +586,145 @@ func TestReconcile_UnregisterLiveDiskPathFailureBlocksUnregister(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, res.IsZero(), "a live-path failure must requeue rather than drop the volume")
 	assert.False(t, unregisterCalled, "UnregisterVolumeEx must not run without a captured live path")
+}
+
+// TestReconcile_UnregisterConvergesOnRaceWhenAlreadyUnregistered reproduces the
+// VGL-62908 CSI-driver race: reconcileUnregister's own writes (two spec
+// patches, then a status patch) each advance metadata.generation and enqueue
+// a fresh reconcile for the same CVI. A racing second reconcile can start and
+// read a client-cache snapshot that predates the first reconcile's status
+// write — landing here with hasDependent=true and a stale ownership of ""/
+// CSIManaged, even though UnregisterVolumeEx has already run to completion.
+// That second reconcile calls QueryLiveDiskPath again, which now fails
+// permanently: the FCD no longer exists as a queryable object once
+// unregistered — a one-way transition, not a transient condition.
+//
+// VolumeProtectionFinalizer is only added, once, right before that
+// destructive call, so its presence on the object handed to this reconcile
+// (unlike status.ownership) is not subject to the same cache race. Its
+// presence here must make the reconciler treat the NotFound as confirmation
+// of a prior success and converge to VMManaged/Succeeded, instead of
+// spiralling into permanent backoff with phase=Failed while the volume is
+// already correctly VM-owned on the vCenter side.
+func TestReconcile_UnregisterConvergesOnRaceWhenAlreadyUnregistered(t *testing.T) {
+	const volID = "vol-race-already-unregistered"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	// Models the stale read the racing reconcile sees: hasDependent (vms set),
+	// ownership still "" (the first reconcile's VMManaged status write has not
+	// reached this reconcile's cache yet), but diskPath/diskUUID and the
+	// finalizer already reflect the first reconcile's completed work.
+	cvi := newCVI(volID, vms, "", "/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", 5,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, id string) (string, error) {
+			assert.Equal(t, volID, id)
+			return "", errors.New("ServerFaultCode: The object or item referred to could not be found")
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero(), "convergence is a success outcome; it must not requeue with backoff")
+	assert.False(t, unregisterCalled,
+		"UnregisterVolumeEx must not be re-attempted against an already-unregistered volume")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"must converge to VMManaged, not remain stuck at the stale CSIManaged/\"\" ownership")
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase,
+		"must not be left in phase=Failed for a disk that is already correctly VM-owned")
+	assert.Empty(t, updated.Status.Error)
+	// diskPath/diskUUID from the earlier successful run must be preserved untouched.
+	assert.Equal(t, "/vmfs/volumes/ds/disk.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, "disk-uuid-123", updated.Spec.DiskUUID)
+}
+
+// TestReconcile_UnregisterSkipsRedundantSpecPatchWhenResultMatchesLivePath
+// verifies the companion mitigation: when UnregisterVolumeEx returns the same
+// diskPath/diskUUID that QueryLiveDiskPath already durably wrote a moment
+// earlier, reconcileUnregister must not issue a second, redundant spec patch.
+// Each spec patch advances metadata.generation and enqueues a fresh reconcile
+// for this object — fewer of them means fewer opportunities for the race
+// covered by TestReconcile_UnregisterConvergesOnRaceWhenAlreadyUnregistered
+// to occur in the first place.
+func TestReconcile_UnregisterSkipsRedundantSpecPatchWhenResultMatchesLivePath(t *testing.T) {
+	const volID = "vol-skip-redundant-patch"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "", "", 3, nil)
+
+	s := newScheme(t)
+	// Only step 3's patch (the one superseding the live path with the
+	// UnregisterVolumeEx result) ever includes diskUUID in its payload — step
+	// 1's live-path patch and ensurePVOwnerRef's ownerReferences patch do not.
+	// Counting on that marker isolates the redundant patch this fix removes
+	// from the other, unrelated patches this reconcile legitimately issues.
+	diskUUIDPatchCount := 0
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch,
+			opts ...client.PatchOption) error {
+			if data, dataErr := patch.Data(obj); dataErr == nil && strings.Contains(string(data), "diskUUID") {
+				diskUUIDPatchCount++
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			return "/vmfs/volumes/ds/disk.vmdk", nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			// Identical to the live path already patched onto spec above.
+			return "/vmfs/volumes/ds/disk.vmdk", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.Equal(t, 0, diskUUIDPatchCount,
+		"the post-unregister spec patch must be skipped when its result matches the live-captured path")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "/vmfs/volumes/ds/disk.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
 }
 
 // TestReconcile_UnregisterObservedGenerationTracksSpecWrite verifies that the

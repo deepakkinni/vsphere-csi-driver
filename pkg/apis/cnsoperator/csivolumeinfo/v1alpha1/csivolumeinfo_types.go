@@ -50,6 +50,21 @@ const (
 	// must be enforced by consulting this CR rather than by relying on CNS to
 	// return NotFound.
 	FcdRetainedAnnotation = "csi.vsphere.vmware.com/fcd-retained"
+
+	// ImportPendingAnnotation marks a CsiVolumeInfo created by the
+	// CnsRegisterVolume deferFcdRegistration ("import") path between the
+	// moment the CR (with spec.vms already populated) is created and the
+	// moment its status is patched to VMManaged. This volume has no backing
+	// FCD by design (see the vm-owned-volume-vm-import-spec), so the
+	// csivolumeinfo controller's ownership-transfer decision table (which
+	// otherwise reads hasDependent && ownership=="" as "new dependent
+	// attach, needs Unregister") MUST NOT act on this CR while the
+	// annotation is present, or it will call QueryLiveDiskPath/Unregister
+	// against a volume that was never registered as an FCD and fails
+	// permanently with a not-found fault. The import path removes this
+	// annotation only after status.ownership has been durably patched to
+	// VMManaged, closing the race.
+	ImportPendingAnnotation = "csi.vsphere.vmware.com/import-pending"
 )
 
 // OwnershipState is the current ownership of the volume.

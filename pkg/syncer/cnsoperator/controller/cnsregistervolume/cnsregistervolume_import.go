@@ -242,6 +242,16 @@ func (r *ReconcileCnsRegisterVolume) ensureCsiVolumeInfoForImport(ctx context.Co
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volumeID),
 			Namespace: csivolumeinfov1alpha1.CVINamespace,
+			// ImportPendingAnnotation is set from creation so the general
+			// csivolumeinfo controller's decision table never observes this
+			// CR (spec.vms populated, status not yet VMManaged) as a normal
+			// new dependent attach and tries to Unregister a volume that was
+			// never registered as an FCD. Removed below only once
+			// status.ownership is durably VMManaged. See the annotation's
+			// doc comment for the full race this closes.
+			Annotations: map[string]string{
+				csivolumeinfov1alpha1.ImportPendingAnnotation: "true",
+			},
 			Finalizers: []string{
 				csivolumeinfov1alpha1.VolumeProtectionFinalizer,
 			},
@@ -284,6 +294,20 @@ func (r *ReconcileCnsRegisterVolume) ensureCsiVolumeInfoForImport(ctx context.Co
 		return fmt.Errorf("PatchCsiVolumeInfoStatus: %w", err)
 	}
 	log.Infof("ensureCsiVolumeInfoForImport: status patched to VMManaged/Succeeded for volumeID %q", volumeID)
+
+	// Only now is it safe to let the general csivolumeinfo controller act on
+	// this CR: status.ownership is durably VMManaged, so its decision table
+	// will treat this as idle (hasDependent && ownership=="VMManaged" is not
+	// the Unregister-triggering case). Remove the marker via a metadata
+	// merge-patch (a `null` value deletes the key).
+	removeAnnotationPatch := []byte(fmt.Sprintf(
+		`{"metadata":{"annotations":{"%s":null}}}`, csivolumeinfov1alpha1.ImportPendingAnnotation))
+	if _, err := r.csiVolumeInfoService.PatchCsiVolumeInfo(ctx, volumeID, removeAnnotationPatch); err != nil {
+		return fmt.Errorf("PatchCsiVolumeInfo (remove %s): %w",
+			csivolumeinfov1alpha1.ImportPendingAnnotation, err)
+	}
+	log.Infof("ensureCsiVolumeInfoForImport: removed %s annotation for volumeID %q",
+		csivolumeinfov1alpha1.ImportPendingAnnotation, volumeID)
 	return nil
 }
 
