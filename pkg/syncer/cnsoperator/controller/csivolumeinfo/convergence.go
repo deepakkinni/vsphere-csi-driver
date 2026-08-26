@@ -152,6 +152,17 @@ func recordedBlockerIsLinkedClone(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool
 	return false
 }
 
+// readyConditionReason returns the reason recorded on the Ready condition, or
+// "" if no such condition exists.
+func readyConditionReason(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) string {
+	for _, c := range cvi.Status.Conditions {
+		if c.Type == conditionTypeReady {
+			return c.Reason
+		}
+	}
+	return ""
+}
+
 // attemptConvergence re-attempts an in-place unregister for a volume that is
 // VMManaged and fcd-retained with at least one VM still attached. Woken by
 // the VolumeSnapshot/VolumeSnapshotContent delete watches or a spec change;
@@ -165,7 +176,9 @@ func recordedBlockerIsLinkedClone(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool
 //  3. If feasible (or the query itself was inconclusive), re-attempt
 //     UnregisterVolumeEx — the attempt is the determination, not the query.
 //  4. On success: refresh spec.diskPath/diskUUID from the result, drop
-//     fcd-retained. No status transition — ownership is already VMManaged.
+//     fcd-retained, and flip the Ready condition to reflect the volume is
+//     fully VM-managed again — the blocker that produced the stale
+//     FcdRetained message is gone, so the condition must be too.
 //  5. On rejection: re-classify the new fault exactly as a fresh unregister
 //     attempt would (handleUnregisterBlocked), so the recorded blocker stays
 //     current.
@@ -217,11 +230,22 @@ func (r *Reconciler) attemptConvergence(ctx context.Context, cvi *csivolumeinfov
 		return fmt.Errorf("attemptConvergence: failed to marshal convergence patch for %q: %w",
 			cvi.Spec.VolumeID, err)
 	}
-	if _, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, patchBytes); err != nil {
+	newGen, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, patchBytes)
+	if err != nil {
 		return fmt.Errorf("attemptConvergence: failed to patch spec/annotations for %q: %w",
 			cvi.Spec.VolumeID, err)
 	}
-	log.Infof("attemptConvergence: fcd-retained annotation cleared for volume %q; no status transition "+
-		"(ownership already VMManaged)", cvi.Spec.VolumeID)
+	log.Infof("attemptConvergence: fcd-retained annotation cleared for volume %q", cvi.Spec.VolumeID)
+
+	statusPatch := buildStatusPatch(newGen,
+		csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		csivolumeinfov1alpha1.PhaseSucceeded, "",
+		"unregister blocker cleared; volume is fully VM-managed", reasonFcdReleased, true)
+	if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, statusPatch); err != nil {
+		return fmt.Errorf("attemptConvergence: failed to patch converged status for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("attemptConvergence: status patched to VMManaged/Succeeded (FcdReleased) for volume %q",
+		cvi.Spec.VolumeID)
 	return nil
 }

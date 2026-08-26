@@ -65,6 +65,7 @@ const (
 	reasonReconcileFailed     = "ReconcileFailed"
 	reasonInitialCSIManaged   = "InitialCSIManaged"
 	reasonFcdRetained         = "FcdRetained"
+	reasonFcdReleased         = "FcdReleased"
 )
 
 var (
@@ -266,6 +267,26 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 	_, fcdRetained := cvi.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation]
 	log.Infof("Reconcile: vmCount=%d hasDependent=%t ownership=%q fcdRetained=%t for %s",
 		vmCount, hasDependent, ownership, fcdRetained, req.Name)
+
+	// Self-correction: the fcd-retained annotation is authoritative for
+	// whether a volume is deferred. If it's gone but the Ready condition
+	// still carries reasonFcdRetained, some prior reconcile cleared the
+	// annotation (attemptConvergence) but crashed, was interrupted, or
+	// otherwise errored before its own status patch landed — or the
+	// condition was left stale by an older build without that patch. Fix it
+	// here rather than leaving a "N FCD snapshots present" message stuck on
+	// a volume that has already converged.
+	if !fcdRetained && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged &&
+		readyConditionReason(cvi) == reasonFcdRetained {
+		log.Infof("Reconcile: %s has stale FcdRetained condition with no fcd-retained annotation; "+
+			"correcting to FcdReleased", req.Name)
+		patch := buildStatusPatch(cvi.Generation, ownership, csivolumeinfov1alpha1.PhaseSucceeded, "",
+			"unregister blocker cleared; volume is fully VM-managed", reasonFcdReleased, true)
+		if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, patch); err != nil {
+			log.Errorf("Reconcile: failed to correct stale FcdRetained condition for %s: %v", req.Name, err)
+			return reconcile.Result{}, err
+		}
+	}
 
 	// Defense in depth for the single-mode-per-volume invariant: the webhook
 	// is the primary enforcement point, this is the fallback for a webhook
