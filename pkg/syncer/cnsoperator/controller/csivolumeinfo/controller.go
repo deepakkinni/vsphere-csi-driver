@@ -369,9 +369,15 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 		// in the log rather than falling through to the generic idle case.
 		log.Infof("Reconcile: %d independent VM(s) attached, ownership=CSIManaged; idle for ownership", vmCount)
 
-	case vmCount == 0 && ownership == "":
-		// Initial state: CR just created, no VMs attached yet. Write the initial
-		// CSIManaged status so vm-operator's observedGeneration wait condition is satisfied.
+	case ownership == "":
+		// Initial state: no status written yet. By this point hasDependent is
+		// known false (a dependent attach with ownership=="" already matched the
+		// first case above), so this covers both "CR just created, no VMs
+		// attached yet" and "an independent-only VM attached before the
+		// controller's first reconcile could write the initial status" (the
+		// latter previously fell through to the default idle case and left
+		// status permanently empty). Write the initial CSIManaged status so
+		// vm-operator's observedGeneration wait condition is satisfied.
 		log.Infof("Reconcile: initial state — writing CSIManaged status for %s", req.Name)
 		patch := buildStatusPatch(cvi.Generation,
 			csivolumeinfov1alpha1.OwnershipStateCSIManaged,
