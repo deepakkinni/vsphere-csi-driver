@@ -2032,7 +2032,8 @@ func (c *controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 		// relying on CNS to report the volume as absent is what covers an
 		// fcd-retained volume, whose FCD and CNS DB row still exist.
 		if isVMOwnedVolumesFSSEnabled && csiVolumeInfoService != nil {
-			if blockErr := assertNotVMManaged(ctx, csiVolumeInfoService, req.VolumeId, "volume deletion"); blockErr != nil {
+			if blockErr := assertNotVMManaged(ctx, csiVolumeInfoService, req.VolumeId, "volume deletion",
+				c.vmOwnedVolumesVMsGone); blockErr != nil {
 				return nil, csifault.CSIInternalFault, logger.LogNewErrorCodef(log, codes.FailedPrecondition,
 					"volume deletion rejected for volume %q: %v", req.VolumeId, blockErr)
 			}
@@ -2779,7 +2780,8 @@ func (c *controller) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshot
 		// of VM-managed disks are not supported through CSI; vm-operator owns
 		// that path.
 		if isVMOwnedVolumesFSSEnabled && csiVolumeInfoService != nil {
-			if blockErr := assertNotVMManaged(ctx, csiVolumeInfoService, volumeID, "snapshot creation"); blockErr != nil {
+			if blockErr := assertNotVMManaged(ctx, csiVolumeInfoService, volumeID, "snapshot creation",
+				nil); blockErr != nil {
 				return nil, logger.LogNewErrorCodef(log, codes.FailedPrecondition,
 					"snapshot creation rejected for volume %q: %v", volumeID, blockErr)
 			}
@@ -3356,6 +3358,11 @@ func (c *controller) ControllerModifyVolume(ctx context.Context, req *csi.Contro
 	}
 }
 
+// vmGoneChecker reports whether the VM(s) that acquired ownership of a
+// VMManaged volume are confirmed gone. namespace and vms come from the
+// CsiVolumeInfo's spec.pvcNamespace / spec.vms.
+type vmGoneChecker func(ctx context.Context, namespace string, vms []csivolumeinfov1alpha1.VirtualMachineRef) bool
+
 // assertNotVMManaged refuses an operation on a volume whose CsiVolumeInfo
 // reports VM ownership. The check consults the CR rather than CNS state
 // because an fcd-retained volume still has a live FCD and CNS DB row, so CNS
@@ -3365,8 +3372,16 @@ func (c *controller) ControllerModifyVolume(ctx context.Context, req *csi.Contro
 // and fail-open on a CVI lookup error, matching every other VM-owned-volume
 // guard in this codebase (blocking unrelated operations on a CVI-service
 // hiccup is the worse failure).
+//
+// vmGoneCheck, when non-nil, is consulted before rejecting: if it confirms
+// the owning VM(s) no longer exist (most commonly because their namespace was
+// force-deleted), the operation is allowed instead of rejected — a gone VM
+// can never come back to release the volume, so continuing to block would
+// leave it stuck forever and get in the way of namespace cleanup. Callers for
+// which VM absence must not change the outcome (e.g. snapshot creation, where
+// the FCD stays permanently unregistered either way) pass nil.
 func assertNotVMManaged(ctx context.Context,
-	cviSvc csivolumeinfosvc.CsiVolumeInfoService, volumeID, operation string) error {
+	cviSvc csivolumeinfosvc.CsiVolumeInfoService, volumeID, operation string, vmGoneCheck vmGoneChecker) error {
 	log := logger.GetLogger(ctx)
 	cvi, err := cviSvc.GetCsiVolumeInfo(ctx, volumeID)
 	if err != nil {
@@ -3375,6 +3390,11 @@ func assertNotVMManaged(ctx context.Context,
 		return nil
 	}
 	if cvi == nil || cvi.Status.Ownership != csivolumeinfov1alpha1.OwnershipStateVMManaged {
+		return nil
+	}
+	if vmGoneCheck != nil && vmGoneCheck(ctx, cvi.Spec.PVCNamespace, cvi.Spec.VMs) {
+		log.Infof("assertNotVMManaged: allowing %s for volume %q; the VM(s) that owned it no longer exist",
+			operation, volumeID)
 		return nil
 	}
 	return fmt.Errorf("volume %q is currently owned by a VM; %s is not allowed", volumeID, operation)
