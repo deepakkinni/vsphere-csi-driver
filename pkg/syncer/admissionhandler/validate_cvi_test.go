@@ -83,6 +83,24 @@ func withK8sClient(t *testing.T, objs ...client.Object) {
 	t.Cleanup(func() { newK8sClient = orig })
 }
 
+// withVMExists stubs checkVMExists so tests don't need a real vm-operator
+// client. existing is the set of VM names (namespace-qualified as
+// "namespace/name") that should report as still existing; any VM not in the
+// set reports as deleted.
+func withVMExists(t *testing.T, existing ...string) {
+	t.Helper()
+	existingSet := make(map[string]bool, len(existing))
+	for _, e := range existing {
+		existingSet[e] = true
+	}
+
+	orig := checkVMExists
+	checkVMExists = func(ctx context.Context, namespace, vmName string) (bool, error) {
+		return existingSet[namespace+"/"+vmName], nil
+	}
+	t.Cleanup(func() { checkVMExists = orig })
+}
+
 func buildBoundPVCAndPV(pvcName, pvcNamespace, pvName, volumeID string) (
 	*corev1.PersistentVolumeClaim, *corev1.PersistentVolume) {
 	pvc := &corev1.PersistentVolumeClaim{
@@ -122,6 +140,7 @@ func TestValidatePVCDeletionForVMOwnedVolumes_IndependentAttached_Rejects(t *tes
 	const volumeID = "vol-independent"
 	pvc, pv := buildBoundPVCAndPV("test-pvc", "test-ns", "test-pv", volumeID)
 	withK8sClient(t, pv)
+	withVMExists(t, "test-ns/vm-a")
 	cvi := buildTestCVIWithVMs(volumeID, csivolumeinfov1alpha1.OwnershipStateCSIManaged,
 		[]csivolumeinfov1alpha1.VirtualMachineRef{
 			{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
@@ -139,6 +158,60 @@ func TestValidatePVCDeletionForVMOwnedVolumes_IndependentAttached_Rejects(t *tes
 	resp := validatePVCDeletionForVMOwnedVolumes(context.Background(), req)
 	if resp.Allowed {
 		t.Fatal("expected an attached independent PVC delete to be rejected")
+	}
+}
+
+// TestValidatePVCDeletionForVMOwnedVolumes_AttachedVMDeleted_Allows verifies
+// that a PVC delete is allowed once none of the VMs referenced in spec.vms
+// exist any more (e.g. their namespace was force-deleted), even though the
+// CsiVolumeInfo record itself hasn't caught up yet.
+func TestValidatePVCDeletionForVMOwnedVolumes_AttachedVMDeleted_Allows(t *testing.T) {
+	withFeatureGateVMOwnedVolumes(t, true)
+	const volumeID = "vol-orphaned"
+	pvc, pv := buildBoundPVCAndPV("test-pvc", "test-ns", "test-pv", volumeID)
+	withK8sClient(t, pv)
+	withVMExists(t) // no VM exists
+	cvi := buildTestCVIWithVMs(volumeID, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		[]csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-deleted"}})
+	withCviService(t, cvi)
+
+	pvcRaw, err := json.Marshal(pvc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &admissionv1.AdmissionRequest{
+		Operation: admissionv1.Delete,
+		OldObject: runtime.RawExtension{Raw: pvcRaw},
+	}
+	resp := validatePVCDeletionForVMOwnedVolumes(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatal("expected PVC delete to be allowed once the referenced VM no longer exists")
+	}
+}
+
+// TestValidatePVCDeletionForVMOwnedVolumes_VMManagedNamespaceDeleted_Allows
+// verifies that a VMManaged CVI with no VM on record (spec.vms empty) falls
+// back to the namespace's deletion state: if the PVC's namespace is gone,
+// there's no VM left that could ever come back to release the volume.
+func TestValidatePVCDeletionForVMOwnedVolumes_VMManagedNamespaceDeleted_Allows(t *testing.T) {
+	withFeatureGateVMOwnedVolumes(t, true)
+	const volumeID = "vol-vmmanaged-idle"
+	pvc, pv := buildBoundPVCAndPV("test-pvc", "test-ns", "test-pv", volumeID)
+	withK8sClient(t, pv) // namespace "test-ns" is not in the fake client, i.e. gone
+	cvi := buildTestCVIWithVMs(volumeID, csivolumeinfov1alpha1.OwnershipStateVMManaged, nil)
+	withCviService(t, cvi)
+
+	pvcRaw, err := json.Marshal(pvc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &admissionv1.AdmissionRequest{
+		Operation: admissionv1.Delete,
+		OldObject: runtime.RawExtension{Raw: pvcRaw},
+	}
+	resp := validatePVCDeletionForVMOwnedVolumes(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatal("expected PVC delete to be allowed when the namespace is already gone")
 	}
 }
 

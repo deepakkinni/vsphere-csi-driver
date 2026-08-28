@@ -21,8 +21,10 @@ import (
 	"encoding/json"
 	"fmt"
 
+	vmoperatortypes "github.com/vmware-tanzu/vm-operator/api/v1alpha2"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	snap "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
@@ -31,6 +33,7 @@ import (
 	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	"sigs.k8s.io/vsphere-csi-driver/v3/pkg/csi/service/logger"
 	csitypes "sigs.k8s.io/vsphere-csi-driver/v3/pkg/csi/types"
+	k8s "sigs.k8s.io/vsphere-csi-driver/v3/pkg/kubernetes"
 )
 
 // cviServiceFactory matches csivolumeinfosvc.InitCsiVolumeInfoService's signature.
@@ -146,6 +149,27 @@ func validatePVCDeletionForVMOwnedVolumes(
 		return &admissionv1.AdmissionResponse{Allowed: true}
 	}
 
+	// The VM(s) that own/attach this volume may already be gone — most commonly
+	// because their namespace was deleted out from under them. A deleted VM can
+	// never come back to release the volume, so continuing to block the PVC
+	// delete would only leave it stuck forever and get in the way of namespace
+	// cleanup. Allow the delete once we can confirm there's no VM left to protect.
+	if attached {
+		if !anyReferencedVMExists(ctx, pvc.Namespace, cvi.Spec.VMs) {
+			log.Infof("validatePVCDeletionForVMOwnedVolumes: allowing delete of PVC %s/%s (volumeID=%q); "+
+				"none of the referenced VMs %v exist any more", pvc.Namespace, pvc.Name, volumeID,
+				vmNames(cvi.Spec.VMs))
+			return &admissionv1.AdmissionResponse{Allowed: true}
+		}
+	} else if isNamespaceBeingDeleted(ctx, pvc.Namespace) {
+		// VMManaged with no attached VM on record: there's no specific VM to
+		// check, so fall back to the namespace's own deletion state.
+		log.Infof("validatePVCDeletionForVMOwnedVolumes: allowing delete of PVC %s/%s (volumeID=%q); "+
+			"volume is VMManaged with no VM on record and namespace %s is being deleted",
+			pvc.Namespace, pvc.Name, volumeID, pvc.Namespace)
+		return &admissionv1.AdmissionResponse{Allowed: true}
+	}
+
 	// Volume is VM-managed, or still has an attached (independent) VM — reject the deletion.
 	log.Infof("validatePVCDeletionForVMOwnedVolumes: rejecting delete of PVC %s/%s "+
 		"(volumeID=%q, ownership=%q, attachedVMs=%d)", pvc.Namespace, pvc.Name, volumeID,
@@ -159,6 +183,62 @@ func validatePVCDeletionForVMOwnedVolumes(
 			Code:    403,
 		},
 	}
+}
+
+// vmExistsFunc matches checkVMExists's signature. Tests can override the
+// checkVMExists package var to inject a fake without a real vm-operator client.
+type vmExistsFunc func(ctx context.Context, namespace, vmName string) (bool, error)
+
+var checkVMExists vmExistsFunc = defaultCheckVMExists
+
+// defaultCheckVMExists reports whether the named VirtualMachine still exists.
+func defaultCheckVMExists(ctx context.Context, namespace, vmName string) (bool, error) {
+	restClientConfig, err := k8s.GetKubeConfig(ctx)
+	if err != nil {
+		return false, err
+	}
+	vmOperatorClient, err := k8s.NewClientForGroup(ctx, restClientConfig, vmoperatortypes.GroupName)
+	if err != nil {
+		return false, err
+	}
+	_, _, err = getVirtualMachine(ctx, vmOperatorClient, vmName, namespace)
+	if err == nil {
+		return true, nil
+	}
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// anyReferencedVMExists reports whether at least one VM named in vms still
+// exists in namespace. It fails open (returns true, i.e. assume the VM is
+// still there) on any error checking a VM, so a transient lookup failure
+// never causes a PVC delete to be wrongly allowed.
+func anyReferencedVMExists(ctx context.Context, namespace string, vms []csivolumeinfov1alpha1.VirtualMachineRef) bool {
+	log := logger.GetLogger(ctx)
+
+	for _, vmRef := range vms {
+		exists, err := checkVMExists(ctx, namespace, vmRef.VMName)
+		if err != nil {
+			log.Warnf("anyReferencedVMExists: failed to check VM %s/%s: %v; assuming it still exists",
+				namespace, vmRef.VMName, err)
+			return true
+		}
+		if exists {
+			return true
+		}
+	}
+	return false
+}
+
+// vmNames returns the VMName of each entry in vms, for logging.
+func vmNames(vms []csivolumeinfov1alpha1.VirtualMachineRef) []string {
+	names := make([]string, len(vms))
+	for i, vm := range vms {
+		names[i] = vm.VMName
+	}
+	return names
 }
 
 // validateSnapshotCreateForVMOwnedVolumes rejects VolumeSnapshot CREATE requests
