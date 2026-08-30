@@ -142,6 +142,42 @@ func IsDiskAttached(ctx context.Context, vm *cnsvsphere.VirtualMachine, volumeID
 	return "", nil
 }
 
+// QueryDiskPathFromVM finds the virtual disk device on the given VM whose
+// backing UUID matches diskUUID and returns its current backing file path.
+// This is the live path for a disk already unregistered from CNS (a
+// VMManaged/dependent volume): once UnregisterVolumeEx runs, the FCD no
+// longer exists in CNS's registry, so QueryVolumeInfo permanently fails
+// "object not found" for it — the VM's own device backing is the only
+// remaining source of truth, and it is authoritative because vm-operator's
+// ReconfigVM_Task (the only thing that can move this disk while it is
+// VM-managed) always updates it synchronously. The disk's UUID survives
+// unregister untouched, so it is the correct join key (VDiskId, used by
+// IsDiskAttached, does not: it's only populated on FCD-backed devices).
+func QueryDiskPathFromVM(ctx context.Context, vm *cnsvsphere.VirtualMachine, diskUUID string) (string, error) {
+	log := logger.GetLogger(ctx)
+	vmDevices, err := vm.Device(ctx)
+	if err != nil {
+		log.Errorf("QueryDiskPathFromVM: failed to get devices from vm: %s", vm.InventoryPath)
+		return "", err
+	}
+	for _, device := range vmDevices {
+		virtualDisk, ok := device.(*types.VirtualDisk)
+		if !ok {
+			continue
+		}
+		backing, ok := virtualDisk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
+		if !ok {
+			continue
+		}
+		if backing.Uuid == diskUUID {
+			log.Infof("QueryDiskPathFromVM: found diskUUID %s at path %q on vm %+v", diskUUID, backing.FileName, vm)
+			return backing.FileName, nil
+		}
+	}
+	return "", logger.LogNewErrorf(log, "QueryDiskPathFromVM: no virtual disk with UUID %q found on vm %s",
+		diskUUID, vm.InventoryPath)
+}
+
 // getNvmeUUID returns the NVME formatted UUID.
 func getNvmeUUID(ctx context.Context, uuid string) (string, error) {
 	log := logger.GetLogger(ctx)

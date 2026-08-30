@@ -37,11 +37,12 @@ import (
 )
 
 // unregisterEligiblePredicate admits an Update when spec changed (generation
-// bump) or when the fcd-retained annotation was added or removed. The
-// default GenerationChangedPredicate would drop the second case, since an
-// annotation-only patch does not bump generation — and that is exactly the
-// wake this predicate exists to admit. Scoped narrowly on purpose: a plain
-// status write must not re-enter the reconciler in a loop.
+// bump) or when the fcd-retained or diskpath-refresh-requested annotation
+// was added or removed. The default GenerationChangedPredicate would drop
+// those cases, since an annotation-only patch does not bump generation —
+// and that is exactly the wake this predicate exists to admit. Scoped
+// narrowly on purpose: a plain status write must not re-enter the
+// reconciler in a loop.
 var unregisterEligiblePredicate = predicate.Funcs{
 	UpdateFunc: func(e event.UpdateEvent) bool {
 		if e.ObjectOld == nil || e.ObjectNew == nil {
@@ -52,7 +53,12 @@ var unregisterEligiblePredicate = predicate.Funcs{
 		}
 		oldRetained := e.ObjectOld.GetAnnotations()[csivolumeinfov1alpha1.FcdRetainedAnnotation]
 		newRetained := e.ObjectNew.GetAnnotations()[csivolumeinfov1alpha1.FcdRetainedAnnotation]
-		return oldRetained != newRetained
+		if oldRetained != newRetained {
+			return true
+		}
+		oldRefresh := e.ObjectOld.GetAnnotations()[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+		newRefresh := e.ObjectNew.GetAnnotations()[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+		return oldRefresh != newRefresh
 	},
 }
 

@@ -137,6 +137,7 @@ func (g *genBumpingCviService) PatchCsiVolumeInfo(
 // QueryUnregisterFeasibility, and CreateVolume independently.
 type testVolumeManager struct {
 	queryLiveDiskPathFn          func(ctx context.Context, volumeID string) (string, error)
+	queryDiskPathFromVMFn        func(ctx context.Context, vmInstanceUUID, diskUUID string) (string, error)
 	unregisterVolumeExFn         func(ctx context.Context, volumeID string) (string, string, string, error)
 	queryUnregisterFeasibilityFn func(ctx context.Context,
 		volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error)
@@ -148,6 +149,13 @@ type testVolumeManager struct {
 func (m *testVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
 	if m.queryLiveDiskPathFn != nil {
 		return m.queryLiveDiskPathFn(ctx, volumeID)
+	}
+	return "test-live-disk-path", nil
+}
+
+func (m *testVolumeManager) QueryDiskPathFromVM(ctx context.Context, vmInstanceUUID, diskUUID string) (string, error) {
+	if m.queryDiskPathFromVMFn != nil {
+		return m.queryDiskPathFromVMFn(ctx, vmInstanceUUID, diskUUID)
 	}
 	return "test-live-disk-path", nil
 }
@@ -1009,6 +1017,256 @@ func TestReconcile_IndependentOnlyIsIdleForOwnership(t *testing.T) {
 	}, updated))
 	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
 		"an independent-only volume must stay CSIManaged")
+}
+
+// TestReconcile_IndependentOnlyResolvesDiskPathOnce verifies that an
+// independent-only CVI with no spec.diskPath yet gets one resolved via
+// QueryLiveDiskPath — the one live query this branch is allowed to make,
+// since an independent attach never runs reconcileUnregister (the only
+// other place a live path gets captured) and vm-operator has no CNS/vslm
+// client of its own to resolve it.
+func TestReconcile_IndependentOnlyResolvesDiskPathOnce(t *testing.T) {
+	const volID = "vol-independent-nopath"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			queryCalled = true
+			return "[datastore1] fcd/resolved.vmdk", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.True(t, queryCalled, "QueryLiveDiskPath must be called to resolve an unset diskPath")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "[datastore1] fcd/resolved.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"resolving diskPath must not transfer ownership")
+}
+
+// TestReconcile_IndependentOnlyWithDiskPathNeverQueriesAgain verifies that
+// once an independent-only CVI's diskPath is set, the reconciler stays a
+// true no-op — QueryLiveDiskPath is not called on every reconcile.
+func TestReconcile_IndependentOnlyWithDiskPathNeverQueriesAgain(t *testing.T) {
+	const volID = "vol-independent-haspath"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged,
+		"[datastore1] fcd/already-resolved.vmdk", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			queryCalled = true
+			return "unexpected", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, queryCalled, "QueryLiveDiskPath must not be called once diskPath is already resolved")
+}
+
+// TestReconcile_DiskPathRefreshRequested_Independent verifies that an
+// independent-only, CSIManaged CVI with the refresh-requested annotation
+// gets spec.diskPath re-resolved and the annotation cleared.
+func TestReconcile_DiskPathRefreshRequested_Independent(t *testing.T) {
+	const volID = "vol-independent-refresh"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged,
+		"[datastore1] fcd/stale.vmdk", "", 1, nil)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			queryCalled = true
+			return "[datastore1] fcd/relocated.vmdk", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.True(t, queryCalled, "QueryLiveDiskPath must be called to re-resolve the requested refresh")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "[datastore1] fcd/relocated.vmdk", updated.Spec.DiskPath)
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.False(t, stillRequested, "refresh-requested annotation must be cleared after the refresh lands")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"a plain refresh must not change ownership")
+}
+
+// TestReconcile_DiskPathRefreshRequested_Dependent verifies that a
+// dependent, VMManaged CVI (already transferred, not fcd-retained) with the
+// refresh-requested annotation gets spec.diskPath re-resolved and the
+// annotation cleared, WITHOUT ever calling UnregisterVolumeEx or CreateVolume
+// — the ownership==VMManaged invariant that diskPath is non-empty must hold
+// throughout, so this must be a plain value replacement, not a transfer.
+func TestReconcile_DiskPathRefreshRequested_Dependent(t *testing.T) {
+	const volID = "vol-dependent-refresh"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"[datastore1] fcd/stale.vmdk", "test-disk-uuid", 1, nil)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled, unregisterCalled, createCalled := false, false, false
+	mgr := &testVolumeManager{
+		queryDiskPathFromVMFn: func(_ context.Context, _, _ string) (string, error) {
+			queryCalled = true
+			return "[datastore1] fcd/relocated.vmdk", nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return nil, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.True(t, queryCalled, "QueryDiskPathFromVM must be called to re-resolve the requested refresh — "+
+		"a VMManaged volume is already unregistered from CNS, so QueryLiveDiskPath cannot be used here")
+	assert.False(t, unregisterCalled, "a plain refresh must not unregister the FCD")
+	assert.False(t, createCalled, "a plain refresh must not re-register/create a volume")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "[datastore1] fcd/relocated.vmdk", updated.Spec.DiskPath)
+	assert.NotEmpty(t, updated.Spec.DiskPath, "diskPath must never be observed empty for a VMManaged volume")
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.False(t, stillRequested, "refresh-requested annotation must be cleared after the refresh lands")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"a plain refresh must not change ownership")
+}
+
+// TestReconcile_DiskPathRefreshRequested_NotYetEligibleDefers verifies that
+// a refresh request against a volume mid-transfer (hasDependent, ownership
+// not yet VMManaged) is deferred rather than acted on immediately — acting
+// here would race the transfer itself.
+func TestReconcile_DiskPathRefreshRequested_NotYetEligibleDefers(t *testing.T) {
+	const volID = "vol-dependent-midtransfer"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, "", "", "", 1, nil)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled, unregisterCalled := false, false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			queryCalled = true
+			return "unexpected", nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.False(t, res.IsZero(), "must requeue rather than act while not yet eligible")
+	assert.False(t, queryCalled, "must not resolve diskPath while mid-transfer")
+	assert.False(t, unregisterCalled, "the refresh check must not itself drive the transfer")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.True(t, stillRequested, "annotation must remain until the volume is eligible")
 }
 
 // TestReconcile_MixedDiskModesFailsLegibly verifies the reconciler-side

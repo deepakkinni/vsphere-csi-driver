@@ -191,6 +191,13 @@ type Manager interface {
 	// path is the FCD's running point (chain tip) and is authoritative even
 	// immediately after a storage vMotion, which a cached read can lag.
 	QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error)
+	// QueryDiskPathFromVM returns the current backing disk path read live from
+	// the VM identified by vmInstanceUUID, for the virtual disk device whose
+	// backing UUID matches diskUUID. Unlike QueryLiveDiskPath, this does not
+	// go through CNS, so it works for a volume already unregistered from CNS
+	// (a VMManaged/dependent volume) — the VM's own device backing is the
+	// only remaining source of truth once that happens.
+	QueryDiskPathFromVM(ctx context.Context, vmInstanceUUID, diskUUID string) (string, error)
 	// QueryUnregisterFeasibility evaluates, per volume and without side effects,
 	// whether an in-place unregister would currently succeed, and which
 	// preconditions block it if not. Results are returned in request order. A
@@ -4716,6 +4723,29 @@ func (m *defaultManager) QueryLiveDiskPath(ctx context.Context, volumeID string)
 
 	log.Infof("QueryLiveDiskPath: exit volumeID=%q filePath=%q", volumeID, diskFileBackingInfo.FilePath)
 	return diskFileBackingInfo.FilePath, nil
+}
+
+// QueryDiskPathFromVM resolves the VM by instance UUID and reads the live
+// backing path of the virtual disk device matching diskUUID directly off
+// the VM — see the Manager interface doc comment for why this bypasses CNS.
+func (m *defaultManager) QueryDiskPathFromVM(ctx context.Context, vmInstanceUUID, diskUUID string) (string, error) {
+	log := logger.GetLogger(ctx).With("vmInstanceUUID", vmInstanceUUID, "diskUUID", diskUUID)
+	log.Infof("QueryDiskPathFromVM: entry vmInstanceUUID=%q diskUUID=%q", vmInstanceUUID, diskUUID)
+
+	vm, err := cnsvsphere.GetVirtualMachineByUUID(ctx, vmInstanceUUID, true)
+	if err != nil {
+		log.Errorf("QueryDiskPathFromVM: failed to find VM for instanceUUID=%q: %v", vmInstanceUUID, err)
+		return "", fmt.Errorf("failed to find VM for instanceUUID %q: %w", vmInstanceUUID, err)
+	}
+
+	filePath, err := QueryDiskPathFromVM(ctx, vm, diskUUID)
+	if err != nil {
+		log.Errorf("QueryDiskPathFromVM: failed for vmInstanceUUID=%q diskUUID=%q: %v", vmInstanceUUID, diskUUID, err)
+		return "", err
+	}
+
+	log.Infof("QueryDiskPathFromVM: exit vmInstanceUUID=%q diskUUID=%q filePath=%q", vmInstanceUUID, diskUUID, filePath)
+	return filePath, nil
 }
 
 // GetDiskFolderURL converts a datastore path ("[dsName] relPath") to the HTTP

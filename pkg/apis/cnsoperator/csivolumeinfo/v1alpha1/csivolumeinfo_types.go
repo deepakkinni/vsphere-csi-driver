@@ -65,6 +65,29 @@ const (
 	// annotation only after status.ownership has been durably patched to
 	// VMManaged, closing the race.
 	ImportPendingAnnotation = "csi.vsphere.vmware.com/import-pending"
+
+	// DiskPathRefreshRequestedAnnotation is set by vm-operator on a CVI whose
+	// spec.diskPath it attempted to consume in a ReconfigVM_Task that failed
+	// with a FileNotFound fault against that exact path — the disk was
+	// relocated (e.g. storage vMotion) after CSI last resolved diskPath, so
+	// the recorded value is stale. It applies to both disk modes: an
+	// independent volume whose diskPath was resolved once at first sight
+	// (see the csivolumeinfo controller's decision table), and a dependent
+	// volume whose diskPath was captured once at ownership transfer.
+	//
+	// vm-operator itself never writes spec.diskPath in this case — for a
+	// dependent volume, status.ownership==VMManaged is a durable invariant
+	// that diskPath is non-empty (it is written by the same reconcile that
+	// sets ownership), so vm-operator clearing it would violate that
+	// invariant and trip vm-operator's own "empty diskPath after green
+	// signal" error. This annotation is therefore the signal, orthogonal to
+	// the field's current value: the csivolumeinfo controller re-resolves
+	// spec.diskPath from a live query and replaces it directly with the
+	// fresh value in one patch — never observably empty in between — then
+	// removes this annotation. vm-operator waits for the annotation to be
+	// gone (and observedGeneration to have advanced past the refresh patch)
+	// before retrying the attach with the new value.
+	DiskPathRefreshRequestedAnnotation = "csi.vsphere.vmware.com/diskpath-refresh-requested"
 )
 
 // OwnershipState is the current ownership of the volume.

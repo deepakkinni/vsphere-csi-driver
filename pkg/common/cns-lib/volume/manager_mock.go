@@ -255,6 +255,15 @@ func (m MockManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (st
 	return "", nil
 }
 
+// QueryDiskPathFromVM is the mock implementation of the VM-backed disk-path
+// read. Returns the configured error on failure, otherwise an empty path.
+func (m MockManager) QueryDiskPathFromVM(ctx context.Context, vmInstanceUUID, diskUUID string) (string, error) {
+	if m.failRequest {
+		return "", m.err
+	}
+	return "", nil
+}
+
 // QueryUnregisterFeasibility is the mock implementation of the feasibility
 // query. Returns the configured error on failure, otherwise an empty result set.
 func (m MockManager) QueryUnregisterFeasibility(ctx context.Context,

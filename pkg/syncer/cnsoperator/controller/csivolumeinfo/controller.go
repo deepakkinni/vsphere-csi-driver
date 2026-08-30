@@ -193,6 +193,7 @@ func hasVolumeProtectionFinalizer(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool
 //	hasDependent  ∧ (ownership=="" ∨ ownership=="CSIManaged")        → reconcileUnregister
 //	ownership=="VMManaged" ∧ fcd-retained ∧ len(spec.vms)>0          → convergence (C8; no-op here)
 //	!hasDependent ∧ ownership=="VMManaged"                           → reconcileRegister
+//	vmCount>0 ∧ !hasDependent ∧ ownership=="CSIManaged" ∧ diskPath==""→ reconcileIndependentDiskPath (one-time)
 //	len(spec.vms)>0 ∧ !hasDependent ∧ ownership=="CSIManaged"        → idle (independent-only; CSI never owns it)
 //	len(spec.vms)==0 ∧ ownership==""                                 → initial CSIManaged
 //	otherwise                                                        → idle (no-op)
@@ -200,6 +201,28 @@ func hasVolumeProtectionFinalizer(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool
 // Independent-only and no-entries are kept as separate cases rather than
 // collapsed into one "idle for ownership" bucket: both mean CSI is idle, but
 // only the second (no entries) permits release.
+//
+// spec.diskPath is a snapshot taken just-in-time at the moment it is first
+// needed, not a continuously-refreshed live mirror — the same convention
+// reconcileUnregister already follows for a dependent attach (it calls
+// QueryLiveDiskPath immediately before consuming the value, not at some
+// earlier point) and the detach path follows for the remove (refreshed
+// again right before the device comes off). An independent volume's path is
+// captured once, here, the first time CSI observes it; vm-operator is
+// expected to consume it promptly afterward. See csi.md §9 for the fuller
+// staleness discussion (why this is a snapshot, not a live mirror, and what
+// happens if the FCD relocates between the write and the consuming attach).
+//
+// DiskPathRefreshRequestedAnnotation (checked before the table above, since
+// it applies across both hasDependent states) is how vm-operator recovers
+// from exactly that relocation: on a ReconfigVM_Task that fails with
+// FileNotFound against the path it read, it sets the annotation instead of
+// touching spec.diskPath itself (see the annotation's doc comment for why —
+// in short, clearing it would violate the ownership==VMManaged invariant).
+// reconcileDiskPathRefresh re-resolves and replaces the value directly, for
+// either mode, once the volume is in a state where a plain re-resolve is
+// safe (independent/CSIManaged, or dependent/VMManaged without
+// fcd-retained) — otherwise the annotation is left for a later reconcile.
 func (r *Reconciler) Reconcile(ctx context.Context,
 	req reconcile.Request) (reconcile.Result, error) {
 	ctx = logger.NewContextWithLogger(ctx)
@@ -288,6 +311,40 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 		}
 	}
 
+	// vm-operator requests a diskPath refresh when a ReconfigVM_Task it
+	// issued failed with FileNotFound against the exact path it read from
+	// spec.diskPath — the disk was relocated after CSI last resolved it.
+	// This is orthogonal to the decision table below: it applies whether
+	// the volume is independent (CSIManaged) or dependent (VMManaged), and
+	// unlike the "resolve when empty" branch for a brand-new independent
+	// volume, it must NOT go through an empty intermediate value for a
+	// dependent volume — ownership==VMManaged is a durable invariant that
+	// diskPath is non-empty. Only act once the volume is in one of the two
+	// states where a plain re-resolve (no unregister, no ownership change)
+	// is safe; otherwise leave the annotation for a later reconcile once
+	// the volume settles (e.g. mid-transfer).
+	if _, refreshRequested := cvi.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]; refreshRequested {
+		eligible := (vmCount > 0 && !hasDependent && ownership == csivolumeinfov1alpha1.OwnershipStateCSIManaged) ||
+			(hasDependent && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged && !fcdRetained)
+		if eligible {
+			log.Infof("Reconcile: %s has %s annotation and is eligible for a plain refresh "+
+				"(hasDependent=%t ownership=%q) → reconcileDiskPathRefresh", req.Name,
+				csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, hasDependent, ownership)
+			if err := r.reconcileDiskPathRefresh(ctx, cvi, hasDependent); err != nil {
+				log.Errorf("Reconcile: reconcileDiskPathRefresh failed: %v", err)
+				doubleBackoffDuration(ctx, nn)
+				return reconcile.Result{RequeueAfter: backoff}, nil
+			}
+			updateBackoffEntry(ctx, nn, time.Second)
+			log.Infof("Reconcile: exit for CsiVolumeInfo %s", req.Name)
+			return reconcile.Result{}, nil
+		}
+		log.Infof("Reconcile: %s has %s annotation but is not yet in an eligible state "+
+			"(hasDependent=%t ownership=%q fcdRetained=%t); deferring", req.Name,
+			csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, hasDependent, ownership, fcdRetained)
+		return reconcile.Result{RequeueAfter: time.Second}, nil
+	}
+
 	// Defense in depth for the single-mode-per-volume invariant: the webhook
 	// is the primary enforcement point, this is the fallback for a webhook
 	// outage. A mixed spec.vms fails legibly rather than guessing which
@@ -356,6 +413,24 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 			if statusErr := r.setFailedStatus(ctx, cvi, err.Error()); statusErr != nil {
 				log.Warnf("Reconcile: could not write failed status: %v", statusErr)
 			}
+			doubleBackoffDuration(ctx, nn)
+			return reconcile.Result{RequeueAfter: backoff}, nil
+		}
+		updateBackoffEntry(ctx, nn, time.Second)
+
+	case vmCount > 0 && !hasDependent && ownership == csivolumeinfov1alpha1.OwnershipStateCSIManaged && cvi.Spec.DiskPath == "":
+		// Independent-only, but spec.diskPath has never been resolved: unlike
+		// a dependent attach (whose diskPath is captured as a side effect of
+		// reconcileUnregister), an independent volume never goes through that
+		// call — CSI is otherwise idle for it — so nothing has ever queried
+		// the FCD's backing path. vm-operator's own attach needs that path
+		// (it has no CNS/vslm client of its own, by design) and would
+		// otherwise wait on it forever. This is the one-time resolution;
+		// once diskPath is set, the case below is a true no-op.
+		log.Infof("Reconcile: %d independent VM(s) attached, ownership=CSIManaged, diskPath unset → "+
+			"reconcileIndependentDiskPath", vmCount)
+		if err := r.reconcileIndependentDiskPath(ctx, cvi); err != nil {
+			log.Errorf("Reconcile: reconcileIndependentDiskPath failed: %v", err)
 			doubleBackoffDuration(ctx, nn)
 			return reconcile.Result{RequeueAfter: backoff}, nil
 		}
@@ -723,6 +798,122 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 	}
 	log.Infof("reconcileUnregister: status patched to VMManaged/Succeeded for volume %q",
 		cvi.Spec.VolumeID)
+	return nil
+}
+
+// reconcileIndependentDiskPath resolves and records spec.diskPath for an
+// independent-mode volume the one time it is needed: an independent attach
+// never runs reconcileUnregister (the only other place a live path gets
+// captured), and CSI otherwise stays fully idle for an independent entry —
+// nothing else in this controller ever queries the FCD's backing. This is a
+// read-only, non-destructive live query; it does not touch ownership, add
+// any finalizer, or transfer the FCD, so a transient failure here is safely
+// retried without altering the CVI's status.
+func (r *Reconciler) reconcileIndependentDiskPath(ctx context.Context,
+	cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
+	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+	log.Infof("reconcileIndependentDiskPath: calling QueryLiveDiskPath for volume %q", cvi.Spec.VolumeID)
+
+	livePath, err := r.volumeManager.QueryLiveDiskPath(ctx, cvi.Spec.VolumeID)
+	if err != nil {
+		return fmt.Errorf("reconcileIndependentDiskPath: QueryLiveDiskPath failed for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileIndependentDiskPath: QueryLiveDiskPath succeeded for volume %q — diskPath=%q",
+		cvi.Spec.VolumeID, livePath)
+
+	specPatch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"diskPath": livePath,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("reconcileIndependentDiskPath: failed to marshal spec patch for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	if _, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, specPatch); err != nil {
+		return fmt.Errorf("reconcileIndependentDiskPath: failed to patch spec.diskPath for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileIndependentDiskPath: patched spec.diskPath for volume %q", cvi.Spec.VolumeID)
+	return nil
+}
+
+// reconcileDiskPathRefresh services a vm-operator-requested refresh of
+// spec.diskPath (DiskPathRefreshRequestedAnnotation): vm-operator's
+// ReconfigVM_Task failed with FileNotFound against the exact path it read,
+// meaning the disk was relocated after CSI last resolved it. This is a
+// plain re-resolve, not a transfer — no unregister, no ownership change, no
+// finalizer — safe for either disk mode. The new value replaces the old one
+// directly in one patch, so spec.diskPath is never observably empty in
+// between; that matters for a dependent volume, where
+// status.ownership==VMManaged is a durable invariant that diskPath is
+// non-empty. The annotation is cleared only after that patch succeeds, so a
+// crash in between leaves the annotation for a retry rather than losing the
+// request.
+//
+// The live read itself differs by mode. An independent-mode volume is still
+// a CNS-registered FCD, so QueryLiveDiskPath's CNS QueryVolumeInfo call
+// works. A dependent-mode (VMManaged) volume was already unregistered by
+// reconcileUnregister earlier in its life — it is no longer an FCD, so that
+// same CNS call permanently fails "object not found". For that case the
+// VM's own device backing (looked up by diskUUID, keyed to the single VM in
+// spec.vms) is the only remaining source of truth, and it is authoritative
+// because vm-operator's ReconfigVM_Task — the only thing that can move this
+// disk while it is VM-managed — updates it synchronously.
+func (r *Reconciler) reconcileDiskPathRefresh(ctx context.Context,
+	cvi *csivolumeinfov1alpha1.CsiVolumeInfo, hasDependent bool) error {
+	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+
+	var livePath string
+	var err error
+	if hasDependent {
+		if len(cvi.Spec.VMs) == 0 {
+			return fmt.Errorf("reconcileDiskPathRefresh: %q is dependent but spec.vms is empty", cvi.Spec.VolumeID)
+		}
+		vmInstanceUUID := cvi.Spec.VMs[0].VMInstanceUUID
+		log.Infof("reconcileDiskPathRefresh: calling QueryDiskPathFromVM for volume %q on VM %q (refresh requested)",
+			cvi.Spec.VolumeID, vmInstanceUUID)
+		livePath, err = r.volumeManager.QueryDiskPathFromVM(ctx, vmInstanceUUID, cvi.Spec.DiskUUID)
+		if err != nil {
+			return fmt.Errorf("reconcileDiskPathRefresh: QueryDiskPathFromVM failed for %q on VM %q: %w",
+				cvi.Spec.VolumeID, vmInstanceUUID, err)
+		}
+	} else {
+		log.Infof("reconcileDiskPathRefresh: calling QueryLiveDiskPath for volume %q (refresh requested)",
+			cvi.Spec.VolumeID)
+		livePath, err = r.volumeManager.QueryLiveDiskPath(ctx, cvi.Spec.VolumeID)
+		if err != nil {
+			return fmt.Errorf("reconcileDiskPathRefresh: QueryLiveDiskPath failed for %q: %w",
+				cvi.Spec.VolumeID, err)
+		}
+	}
+	log.Infof("reconcileDiskPathRefresh: live read succeeded for volume %q — diskPath=%q",
+		cvi.Spec.VolumeID, livePath)
+
+	specPatch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"diskPath": livePath,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("reconcileDiskPathRefresh: failed to marshal spec patch for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	if _, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, specPatch); err != nil {
+		return fmt.Errorf("reconcileDiskPathRefresh: failed to patch spec.diskPath for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileDiskPathRefresh: patched spec.diskPath=%q for volume %q", livePath, cvi.Spec.VolumeID)
+
+	removeAnnotationPatch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{"%s":null}}}`,
+		csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation))
+	if _, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, removeAnnotationPatch); err != nil {
+		return fmt.Errorf("reconcileDiskPathRefresh: failed to clear %s for %q: %w",
+			csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, cvi.Spec.VolumeID, err)
+	}
+	log.Infof("reconcileDiskPathRefresh: cleared %s for volume %q",
+		csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, cvi.Spec.VolumeID)
 	return nil
 }
 
