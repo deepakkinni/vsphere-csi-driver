@@ -51,6 +51,30 @@ const (
 	// return NotFound.
 	FcdRetainedAnnotation = "csi.vsphere.vmware.com/fcd-retained"
 
+	// UnregisterAttemptedAnnotation records that reconcileUnregister has
+	// reached its destructive UnregisterVolumeEx call for this volume. It is
+	// written in the same metadata patch that adds VolumeProtectionFinalizer,
+	// immediately before that call, and cleared by finishRelease once the
+	// volume is back to CSIManaged.
+	//
+	// It exists because VolumeProtectionFinalizer cannot carry this meaning.
+	// The finalizer answers "must GC be blocked?", which stops being true the
+	// moment the last dependent VM detaches; this annotation answers "has the
+	// FCD already been unregistered?", which stays true until the volume is
+	// re-registered. Encoding both in the finalizer means any code acting on
+	// the first fact destroys the evidence for the second — which is exactly
+	// how a stray finalizer left by a cancelled mid-attach became
+	// unremovable: removing it would have broken reconcileUnregister's
+	// crash-recovery path, which keys on that same bit.
+	//
+	// Consumers must treat this as authoritative over status.ownership when
+	// deciding whether a destructive call has already happened:
+	// status.ownership is read through the informer cache and a racing
+	// reconcile can observe a snapshot that predates an earlier reconcile's
+	// own status write, whereas this annotation is written before the call it
+	// guards.
+	UnregisterAttemptedAnnotation = "csi.vsphere.vmware.com/unregister-attempted"
+
 	// ImportPendingAnnotation marks a CsiVolumeInfo created by the
 	// CnsRegisterVolume deferFcdRegistration ("import") path between the
 	// moment the CR (with spec.vms already populated) is created and the

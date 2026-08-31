@@ -25,6 +25,7 @@ import (
 	snapv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	cnstypes "github.com/vmware/govmomi/cns/types"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -167,6 +168,18 @@ func readyConditionReason(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) string {
 		}
 	}
 	return ""
+}
+
+// readyCondition returns the Ready condition, or nil if it has never been
+// written. Used where a status rewrite must preserve the existing condition
+// verbatim rather than assert a new one.
+func readyCondition(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) *metav1.Condition {
+	for i := range cvi.Status.Conditions {
+		if cvi.Status.Conditions[i].Type == conditionTypeReady {
+			return &cvi.Status.Conditions[i]
+		}
+	}
+	return nil
 }
 
 // attemptConvergence re-attempts an in-place unregister for a volume that is

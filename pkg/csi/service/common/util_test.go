@@ -965,6 +965,9 @@ func (m *cbtFlagsMockVolumeManager) GetDiskFolderURL(context.Context, string) (s
 func (m *cbtFlagsMockVolumeManager) QueryLiveDiskPath(context.Context, string) (string, error) {
 	return "", nil
 }
+func (m *cbtFlagsMockVolumeManager) QueryDiskPathFromVM(context.Context, string, string) (string, error) {
+	return "", nil
+}
 func (m *cbtFlagsMockVolumeManager) QueryUnregisterFeasibility(context.Context,
 	[]string) ([]cnsvolume.UnregisterFeasibility, error) {
 	return nil, nil

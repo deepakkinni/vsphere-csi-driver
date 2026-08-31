@@ -261,6 +261,12 @@ func (m *MockVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID stri
 	return "", nil
 }
 
+// QueryDiskPathFromVM is a stub implementation of the VM-backed disk-path read.
+func (m *MockVolumeManager) QueryDiskPathFromVM(ctx context.Context,
+	vmInstanceUUID, diskUUID string) (string, error) {
+	return "", nil
+}
+
 // QueryUnregisterFeasibility is a stub implementation of the feasibility query.
 func (m *MockVolumeManager) QueryUnregisterFeasibility(ctx context.Context,
 	volumeIDs []string) ([]cnsvolume.UnregisterFeasibility, error) {

@@ -282,6 +282,11 @@ func (m *mockVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID stri
 	return "", nil
 }
 
+func (m *mockVolumeManager) QueryDiskPathFromVM(ctx context.Context,
+	vmInstanceUUID, diskUUID string) (string, error) {
+	return "", nil
+}
+
 func (m *mockVolumeManager) QueryUnregisterFeasibility(ctx context.Context,
 	volumeIDs []string) ([]cnsvolume.UnregisterFeasibility, error) {
 	return nil, nil

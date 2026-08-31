@@ -19,6 +19,7 @@ package volume
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 
@@ -142,17 +143,33 @@ func IsDiskAttached(ctx context.Context, vm *cnsvsphere.VirtualMachine, volumeID
 	return "", nil
 }
 
+// ErrDiskNotAttachedToVM is returned by QueryDiskPathFromVM when the VM
+// carries no virtual disk with the requested backing UUID.
+//
+// Callers must distinguish this from a genuine query failure. It is not an
+// error about the disk's existence — the VMDK is fine, it simply is not part
+// of this VM's hardware right now, so the VM cannot answer where it lives.
+// The only correct response is to fall back to a source that does not depend
+// on attachment; treating it as a hard failure deadlocks any caller that is
+// itself gating the attach on the answer.
+var ErrDiskNotAttachedToVM = errors.New("no virtual disk with the requested UUID is attached to the VM")
+
 // QueryDiskPathFromVM finds the virtual disk device on the given VM whose
 // backing UUID matches diskUUID and returns its current backing file path.
 // This is the live path for a disk already unregistered from CNS (a
 // VMManaged/dependent volume): once UnregisterVolumeEx runs, the FCD no
 // longer exists in CNS's registry, so QueryVolumeInfo permanently fails
 // "object not found" for it — the VM's own device backing is the only
-// remaining source of truth, and it is authoritative because vm-operator's
-// ReconfigVM_Task (the only thing that can move this disk while it is
-// VM-managed) always updates it synchronously. The disk's UUID survives
-// unregister untouched, so it is the correct join key (VDiskId, used by
-// IsDiskAttached, does not: it's only populated on FCD-backed devices).
+// remaining source of truth *while the disk is attached*, and it is
+// authoritative because vm-operator's ReconfigVM_Task (the only thing that
+// can move this disk while it is VM-managed) always updates it
+// synchronously. The disk's UUID survives unregister untouched, so it is the
+// correct join key (VDiskId, used by IsDiskAttached, does not: it's only
+// populated on FCD-backed devices).
+//
+// The attachment precondition is load-bearing: if the disk is not on the VM
+// this returns ErrDiskNotAttachedToVM, and the caller must not read that as
+// "the path could not be resolved".
 func QueryDiskPathFromVM(ctx context.Context, vm *cnsvsphere.VirtualMachine, diskUUID string) (string, error) {
 	log := logger.GetLogger(ctx)
 	vmDevices, err := vm.Device(ctx)
@@ -174,8 +191,10 @@ func QueryDiskPathFromVM(ctx context.Context, vm *cnsvsphere.VirtualMachine, dis
 			return backing.FileName, nil
 		}
 	}
-	return "", logger.LogNewErrorf(log, "QueryDiskPathFromVM: no virtual disk with UUID %q found on vm %s",
+	log.Infof("QueryDiskPathFromVM: no virtual disk with UUID %q is attached to vm %s",
 		diskUUID, vm.InventoryPath)
+	return "", fmt.Errorf("QueryDiskPathFromVM: diskUUID %q on vm %s: %w",
+		diskUUID, vm.InventoryPath, ErrDiskNotAttachedToVM)
 }
 
 // getNvmeUUID returns the NVME formatted UUID.

@@ -194,13 +194,13 @@ func TestCsiVolumeInfoService_Finalizers(t *testing.T) {
 	}
 
 	// Add finalizer
-	if err := svc.AddVolumeProtectionFinalizer(ctx, volumeID); err != nil {
-		t.Fatalf("AddVolumeProtectionFinalizer: %v", err)
+	if err := svc.MarkUnregisterInFlight(ctx, volumeID); err != nil {
+		t.Fatalf("MarkUnregisterInFlight: %v", err)
 	}
 
 	// Idempotent add
-	if err := svc.AddVolumeProtectionFinalizer(ctx, volumeID); err != nil {
-		t.Fatalf("idempotent AddVolumeProtectionFinalizer: %v", err)
+	if err := svc.MarkUnregisterInFlight(ctx, volumeID); err != nil {
+		t.Fatalf("idempotent MarkUnregisterInFlight: %v", err)
 	}
 
 	// Verify finalizer is present
@@ -217,6 +217,14 @@ func TestCsiVolumeInfoService_Finalizers(t *testing.T) {
 	if !found {
 		t.Errorf("finalizer %q not found; got %v",
 			csivolumeinfov1alpha1.VolumeProtectionFinalizer, got.Finalizers)
+	}
+
+	// The unregister-attempted marker must land in the same write as the
+	// finalizer — a finalizer without it is exactly the state that used to be
+	// unrecoverable.
+	if _, ok := got.Annotations[csivolumeinfov1alpha1.UnregisterAttemptedAnnotation]; !ok {
+		t.Errorf("annotation %q not set alongside the finalizer; got %v",
+			csivolumeinfov1alpha1.UnregisterAttemptedAnnotation, got.Annotations)
 	}
 
 	// Remove finalizer

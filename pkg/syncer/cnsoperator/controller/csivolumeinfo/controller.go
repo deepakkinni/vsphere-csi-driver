@@ -81,6 +81,7 @@ func newReconciler(mgr manager.Manager, volumeManager volumes.Manager,
 	cviSvc csivolumeinfosvc.CsiVolumeInfoService) reconcile.Reconciler {
 	return &Reconciler{
 		client:        mgr.GetClient(),
+		apiReader:     mgr.GetAPIReader(),
 		scheme:        mgr.GetScheme(),
 		configInfo:    configInfo,
 		volumeManager: volumeManager,
@@ -122,7 +123,11 @@ var _ reconcile.Reconciler = &Reconciler{}
 // Reconciler reconciles CsiVolumeInfo objects.
 type Reconciler struct {
 	// client is a split client: reads from cache, writes to the API server.
-	client        client.Client
+	client client.Client
+	// apiReader reads straight from the API server, bypassing the informer
+	// cache. Used only where a stale read would be unsafe rather than merely
+	// slow — see clearStrayVolumeProtectionFinalizer.
+	apiReader     client.Reader
 	scheme        *runtime.Scheme
 	configInfo    *commonconfig.ConfigurationInfo
 	volumeManager volumes.Manager
@@ -162,11 +167,14 @@ func hasIndependentEntry(vms []csivolumeinfov1alpha1.VirtualMachineRef) bool {
 }
 
 // hasVolumeProtectionFinalizer reports whether the CVI already carries
-// VolumeProtectionFinalizer. reconcileUnregister adds this finalizer once,
-// right before its destructive UnregisterVolumeEx call — its presence is a
-// durable, structural signal that some earlier reconcile for this same CVI
-// got at least that far, independent of the informer cache's view of
-// status.ownership (which the racing reconcile below cannot trust).
+// VolumeProtectionFinalizer, i.e. whether GC is currently blocked for it.
+//
+// This answers only that question. It is NOT a signal that UnregisterVolumeEx
+// has run — use hasUnregisterAttempted for that. The two were conflated
+// historically, which made a finalizer left behind by a cancelled mid-attach
+// impossible to remove safely: stripping it broke reconcileUnregister's
+// crash-recovery path, which read the same bit as proof the destructive call
+// had already completed.
 func hasVolumeProtectionFinalizer(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool {
 	for _, f := range cvi.Finalizers {
 		if f == csivolumeinfov1alpha1.VolumeProtectionFinalizer {
@@ -174,6 +182,17 @@ func hasVolumeProtectionFinalizer(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool
 		}
 	}
 	return false
+}
+
+// hasUnregisterAttempted reports whether some reconcile for this CVI has
+// already reached its destructive UnregisterVolumeEx call. The annotation is
+// written before that call, in the same metadata patch that adds the
+// finalizer, so its presence is durable and — unlike status.ownership, which
+// is read through the informer cache — cannot be missed by a racing reconcile
+// that started before an earlier reconcile's status write became visible.
+func hasUnregisterAttempted(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool {
+	_, ok := cvi.Annotations[csivolumeinfov1alpha1.UnregisterAttemptedAnnotation]
+	return ok
 }
 
 // Reconcile reads the state of the CsiVolumeInfo CR and drives the volume
@@ -192,6 +211,7 @@ func hasVolumeProtectionFinalizer(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool
 //
 //	hasDependent  ∧ (ownership=="" ∨ ownership=="CSIManaged")        → reconcileUnregister
 //	ownership=="VMManaged" ∧ fcd-retained ∧ len(spec.vms)>0          → convergence (C8; no-op here)
+//	!hasDependent ∧ ownership!="VMManaged" ∧ unregister-attempted    → converge status to VMManaged, requeue
 //	!hasDependent ∧ ownership=="VMManaged"                           → reconcileRegister
 //	vmCount>0 ∧ !hasDependent ∧ ownership=="CSIManaged" ∧ diskPath==""→ reconcileIndependentDiskPath (one-time)
 //	len(spec.vms)>0 ∧ !hasDependent ∧ ownership=="CSIManaged"        → idle (independent-only; CSI never owns it)
@@ -201,6 +221,16 @@ func hasVolumeProtectionFinalizer(cvi *csivolumeinfov1alpha1.CsiVolumeInfo) bool
 // Independent-only and no-entries are kept as separate cases rather than
 // collapsed into one "idle for ownership" bucket: both mean CSI is idle, but
 // only the second (no entries) permits release.
+//
+// The two unregister-attempted rows above (the table row, and
+// clearStrayVolumeProtectionFinalizer which runs before the table) exist for
+// the same reason and split the same way. An attach can be cancelled at any
+// point during ownership transfer, and the marker is what says which side of
+// the destructive call it was cancelled on: before it, the finalizer is
+// stray and gets stripped; after it, the FCD really is gone and status has
+// to catch up to that before the register path can undo it. Neither state is
+// reachable by the rest of the table, which only ever sees consistent
+// (spec.vms, status.ownership) pairs.
 //
 // spec.diskPath is a snapshot taken just-in-time at the moment it is first
 // needed, not a continuously-refreshed live mirror — the same convention
@@ -311,6 +341,20 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 		}
 	}
 
+	// Self-correction: strip a volume-protection finalizer left behind by an
+	// attach that was cancelled before ownership transfer began. Nothing in
+	// the decision table below can clean this up (see the helper's comment),
+	// so it has to happen here, before the table runs.
+	requeue, err := r.clearStrayVolumeProtectionFinalizer(ctx, cvi, hasDependent)
+	if err != nil {
+		log.Errorf("Reconcile: failed to clear stray volume-protection finalizer for %s: %v",
+			req.Name, err)
+		return reconcile.Result{}, err
+	}
+	if requeue {
+		return reconcile.Result{RequeueAfter: time.Second}, nil
+	}
+
 	// vm-operator requests a diskPath refresh when a ReconfigVM_Task it
 	// issued failed with FileNotFound against the exact path it read from
 	// spec.diskPath — the disk was relocated after CSI last resolved it.
@@ -339,10 +383,42 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 			log.Infof("Reconcile: exit for CsiVolumeInfo %s", req.Name)
 			return reconcile.Result{}, nil
 		}
-		log.Infof("Reconcile: %s has %s annotation but is not yet in an eligible state "+
-			"(hasDependent=%t ownership=%q fcdRetained=%t); deferring", req.Name,
-			csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, hasDependent, ownership, fcdRetained)
-		return reconcile.Result{RequeueAfter: time.Second}, nil
+		// Not eligible. Distinguish "not yet" from "never", because deferring
+		// unconditionally is an unbounded stall, not a wait: this branch
+		// returns before the decision table below, so nothing else can act on
+		// the volume while the annotation is set.
+		//
+		// A volume with no dependent VM attached and ownership==VMManaged is
+		// the "never" case. There is no VM device list to re-resolve the path
+		// from, so the refresh is unserviceable — and it is also moot, because
+		// the only thing left to do with this volume is release it, which the
+		// decision table does via reconcileRegister. Deferring instead trapped
+		// it: reconciled once a second forever, ownership stuck at VMManaged,
+		// the volume-protection finalizer never dropped, and its PVC and PV
+		// therefore permanently undeletable. Observed in the field at exactly
+		// 1 Hz on volumes whose VM had already been deleted.
+		//
+		// Clear the annotation and fall through so the release can proceed.
+		if !hasDependent && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged {
+			log.Infof("Reconcile: %s has %s annotation but no dependent VM is attached "+
+				"(ownership=%q), so there is no device list to re-resolve from and nothing to refresh "+
+				"for — clearing the annotation so the volume can be released", req.Name,
+				csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, ownership)
+			if err := r.clearDiskPathRefreshRequested(ctx, cvi); err != nil {
+				log.Errorf("Reconcile: failed to clear unserviceable %s for %s: %v",
+					csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, req.Name, err)
+				doubleBackoffDuration(ctx, nn)
+				return reconcile.Result{RequeueAfter: backoff}, nil
+			}
+			// Fall through to the decision table with the annotation gone.
+		} else {
+			// Genuinely transient — e.g. mid-transfer, where ownership is
+			// still settling and a later reconcile will find it eligible.
+			log.Infof("Reconcile: %s has %s annotation but is not yet in an eligible state "+
+				"(hasDependent=%t ownership=%q fcdRetained=%t); deferring", req.Name,
+				csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, hasDependent, ownership, fcdRetained)
+			return reconcile.Result{RequeueAfter: time.Second}, nil
+		}
 	}
 
 	// Defense in depth for the single-mode-per-volume invariant: the webhook
@@ -406,6 +482,44 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 		}
 		updateBackoffEntry(ctx, nn, time.Second)
 
+	case !hasDependent && ownership != csivolumeinfov1alpha1.OwnershipStateVMManaged &&
+		hasUnregisterAttempted(cvi):
+		// The mirror image of the stray-finalizer case above: here the
+		// destructive call DID happen (the marker is on record) but the detach
+		// landed before the status flip, so the FCD is gone while
+		// status.ownership still reads "" or CSIManaged. Left alone, this
+		// falls through to the initial-CSIManaged or idle branch and the CVI
+		// permanently misreports a volume that is now a plain VMDK — and
+		// reconcileRegister, the only thing that can turn it back into an
+		// FCD, is unreachable because it requires ownership==VMManaged.
+		//
+		// Converge to VMManaged first and let the next pass take the
+		// reconcileRegister branch below. Splitting it over two passes rather
+		// than calling reconcileRegister inline keeps a single meaning for
+		// each state: this branch only repairs status to match what already
+		// happened on the storage side, and the register path stays the one
+		// place that re-registers.
+		log.Infof("Reconcile: no dependent VM(s) attached and ownership=%q, but an unregister is on "+
+			"record for %s — converging status to VMManaged so the register path can pick it up",
+			ownership, req.Name)
+		// Order matters: the finalizer must be in place before status reads
+		// VMManaged. Idempotent, and the marker is already set.
+		if err := r.cviSvc.MarkUnregisterInFlight(ctx, cvi.Spec.VolumeID); err != nil {
+			log.Errorf("Reconcile: failed to re-assert protection finalizer for %s: %v", req.Name, err)
+			return reconcile.Result{}, err
+		}
+		patch := buildStatusPatch(cvi.Generation,
+			csivolumeinfov1alpha1.OwnershipStateVMManaged,
+			csivolumeinfov1alpha1.PhaseSucceeded, "", "", reasonUnregisterSucceeded, true)
+		if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, patch); err != nil {
+			log.Errorf("Reconcile: failed to converge status to VMManaged for %s: %v", req.Name, err)
+			return reconcile.Result{}, err
+		}
+		// A status-only write is dropped by unregisterEligiblePredicate, so
+		// this reconcile has to schedule its own follow-up.
+		log.Infof("Reconcile: exit for CsiVolumeInfo %s (requeued for register)", req.Name)
+		return reconcile.Result{RequeueAfter: time.Second}, nil
+
 	case !hasDependent && ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged:
 		log.Infof("Reconcile: no dependent VM(s) attached, ownership=VMManaged → reconcileRegister")
 		if err := r.reconcileRegister(ctx, cvi); err != nil {
@@ -465,6 +579,20 @@ func (r *Reconciler) Reconcile(ctx context.Context,
 
 	default:
 		log.Infof("Reconcile: idle — vmCount=%d, ownership=%q; no action", vmCount, ownership)
+		// Idle means "this spec needs no action from CSI" — which still has to
+		// be *reported*, because vm-operator's green-signal check is
+		// status.observedGeneration >= metadata.generation. vm-operator writes
+		// spec.vms itself (it fills in diskMode/volumeName on an existing
+		// entry after the initial attach request), and any such write bumps
+		// generation after our last status patch. Without this, the CVI sits
+		// at generation=N+1 / observedGeneration=N forever: no branch above
+		// matches a settled dependent+VMManaged volume, so nothing ever
+		// republishes status, the green signal never returns true, and
+		// vm-operator waits on an attach it will never start.
+		if err := r.recordObservedGeneration(ctx, cvi); err != nil {
+			log.Errorf("Reconcile: failed to record observedGeneration for %s: %v", req.Name, err)
+			return reconcile.Result{}, err
+		}
 	}
 
 	log.Infof("Reconcile: exit for CsiVolumeInfo %s", req.Name)
@@ -666,20 +794,58 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 		// disk (FCD) to query; UnregisterVolumeEx is a one-way transition, so
 		// this is a permanent NotFound, not a transient one.
 		//
-		// VolumeProtectionFinalizer is only ever added a few lines below, once,
-		// right before that destructive call — its presence on the object we
-		// were handed is a durable signal (unlike status.ownership here, not
-		// subject to the same cache race) that some earlier reconcile for this
-		// CVI already got that far. If so, treat this failure as confirmation
-		// that unregister already succeeded rather than a genuine error, and
-		// converge straight to VMManaged/Succeeded using the diskPath/diskUUID
-		// that earlier reconcile already durably recorded on spec — no further
-		// destructive calls are needed or safe to make.
-		if hasVolumeProtectionFinalizer(cvi) {
-			log.Infof("reconcileUnregister: QueryLiveDiskPath failed for %q but the volume-protection "+
-				"finalizer is already present, implying an earlier reconcile already completed "+
-				"UnregisterVolumeEx for this volume; converging to VMManaged/Succeeded without retrying "+
-				"the destructive call: %v", cvi.Spec.VolumeID, err)
+		// UnregisterAttemptedAnnotation is only ever added a few lines below,
+		// once, right before that destructive call — its presence on the
+		// object we were handed is a durable signal (unlike status.ownership
+		// here, not subject to the same cache race) that some earlier
+		// reconcile for this CVI already got that far. If so, treat this
+		// failure as confirmation that unregister already succeeded rather
+		// than a genuine error, and converge straight to VMManaged/Succeeded
+		// using the diskPath/diskUUID that earlier reconcile already durably
+		// recorded on spec — no further destructive calls are needed or safe
+		// to make.
+		//
+		// The annotation is the signal, not VolumeProtectionFinalizer: the
+		// finalizer is also (correctly) removed by the release path and by
+		// clearStrayVolumeProtectionFinalizer, so reading it as the primary
+		// signal would let an unrelated, legitimate finalizer removal erase
+		// this branch's evidence and send the reconcile back into the
+		// destructive call — or, worse, let it converge to VMManaged with no
+		// protection finalizer at all.
+		//
+		// The finalizer is still accepted as a fallback, for one release, to
+		// cover CVIs written before UnregisterAttemptedAnnotation existed. The
+		// exposure is narrow but real: a CVI caught exactly mid-transfer by
+		// the upgrade (unregister completed, status flip not yet landed —
+		// precisely the window a syncer restart creates) carries a finalizer
+		// and no annotation, and gating on the annotation alone would send it
+		// into permanent backoff with phase=Failed on a disk that is already
+		// VM-owned. That is the exact failure this convergence branch was
+		// written to prevent, so it must not regress across the upgrade that
+		// introduces the fix.
+		//
+		// Accepting the finalizer here is safe in a way that accepting it in
+		// clearStrayVolumeProtectionFinalizer would not be: this branch is
+		// only reachable with hasDependent true, where the stray-clear never
+		// fires, so the two can never race over the same bit. Drop the
+		// fallback once no pre-annotation CVIs can remain in the field.
+		if hasUnregisterAttempted(cvi) || hasVolumeProtectionFinalizer(cvi) {
+			log.Infof("reconcileUnregister: QueryLiveDiskPath failed for %q but an unregister is already "+
+				"on record (attempted-annotation=%t legacy-finalizer-fallback=%t), implying an earlier "+
+				"reconcile already completed UnregisterVolumeEx for this volume; converging to "+
+				"VMManaged/Succeeded without retrying the destructive call: %v",
+				cvi.Spec.VolumeID, hasUnregisterAttempted(cvi),
+				!hasUnregisterAttempted(cvi) && hasVolumeProtectionFinalizer(cvi), err)
+			// Re-assert the finalizer before the status flip. Under the old
+			// gating this was implied — the finalizer was the gate, so it was
+			// necessarily present. Now that the annotation is the gate, the
+			// two can in principle be observed apart, and the invariant
+			// "status.ownership==VMManaged ⇒ protection finalizer present"
+			// must be upheld explicitly rather than assumed. Idempotent.
+			if markErr := r.cviSvc.MarkUnregisterInFlight(ctx, cvi.Spec.VolumeID); markErr != nil {
+				return fmt.Errorf("reconcileUnregister: failed to re-assert protection finalizer for %q "+
+					"on already-unregistered convergence: %w", cvi.Spec.VolumeID, markErr)
+			}
 			statusPatch := buildStatusPatch(cvi.Generation,
 				csivolumeinfov1alpha1.OwnershipStateVMManaged,
 				csivolumeinfov1alpha1.PhaseSucceeded, "", "", reasonUnregisterSucceeded, true)
@@ -724,14 +890,20 @@ func (r *Reconciler) reconcileUnregister(ctx context.Context,
 	log.Infof("reconcileUnregister: patched live spec.diskPath for volume %q (generation=%d)",
 		cvi.Spec.VolumeID, patchedGen)
 
-	// Add the volume-protection finalizer before the destructive call so GC is
-	// blocked. Finalizer changes are metadata-only and do not advance
-	// generation, so patchedGen remains the generation to record in status.
-	if err := r.cviSvc.AddVolumeProtectionFinalizer(ctx, cvi.Spec.VolumeID); err != nil {
-		return fmt.Errorf("reconcileUnregister: failed to add protection finalizer for %q: %w",
+	// Add the volume-protection finalizer, and the unregister-attempted
+	// annotation that records this reconcile is about to make the destructive
+	// call, before making it: GC blocked, and the fact durably recorded for
+	// any later reconcile (including one on a restarted controller) that has
+	// to decide whether the FCD is already gone. One patch for both, so a
+	// crash cannot leave a finalizer without its annotation. Metadata changes
+	// do not advance generation, so patchedGen remains the generation to
+	// record in status.
+	if err := r.cviSvc.MarkUnregisterInFlight(ctx, cvi.Spec.VolumeID); err != nil {
+		return fmt.Errorf("reconcileUnregister: failed to mark unregister in flight for %q: %w",
 			cvi.Spec.VolumeID, err)
 	}
-	log.Infof("reconcileUnregister: volume-protection finalizer added for volume %q", cvi.Spec.VolumeID)
+	log.Infof("reconcileUnregister: volume-protection finalizer and unregister-attempted annotation "+
+		"added for volume %q", cvi.Spec.VolumeID)
 
 	log.Infof("reconcileUnregister: calling UnregisterVolumeEx for volume %q", cvi.Spec.VolumeID)
 	backingDiskPath, diskUUID, faultType, unregErr := r.volumeManager.UnregisterVolumeEx(ctx, cvi.Spec.VolumeID)
@@ -875,7 +1047,41 @@ func (r *Reconciler) reconcileDiskPathRefresh(ctx context.Context,
 		log.Infof("reconcileDiskPathRefresh: calling QueryDiskPathFromVM for volume %q on VM %q (refresh requested)",
 			cvi.Spec.VolumeID, vmInstanceUUID)
 		livePath, err = r.volumeManager.QueryDiskPathFromVM(ctx, vmInstanceUUID, cvi.Spec.DiskUUID)
-		if err != nil {
+		switch {
+		case errors.Is(err, volumes.ErrDiskNotAttachedToVM):
+			// The disk is not part of the VM's hardware, so the VM cannot say
+			// where it lives. This is the normal case, not an exception:
+			// vm-operator requests a refresh from the failure path of its own
+			// AttachVolumeDisks, so at the moment the annotation is written
+			// the attach has just failed and the disk is by definition not
+			// attached. vm-operator then refuses to attach while the
+			// annotation is set (it cannot trust spec.diskPath), and we cannot
+			// clear the annotation without a path — a mutual wait that never
+			// resolves. Erroring out here is what made that deadlock
+			// permanent.
+			//
+			// Keeping the recorded path is also the right answer, not merely
+			// the deadlock-breaking one. Only a VM-level operation
+			// (ReconfigVM_Task, storage vMotion) relocates a VMDK, and all of
+			// them require the disk to be attached; a detached VMDK cannot
+			// have moved since the path was recorded, so the existing value is
+			// still correct and the refresh is legitimately a no-op. Clear the
+			// annotation and let vm-operator proceed.
+			if cvi.Spec.DiskPath == "" {
+				// Nothing recorded and nothing to read it from: this would
+				// publish an empty diskPath for a VMManaged volume, breaking
+				// the invariant vm-operator's attach path relies on. Keep the
+				// annotation and retry.
+				return fmt.Errorf("reconcileDiskPathRefresh: %q has an empty spec.diskPath and its disk is "+
+					"not attached to VM %q, so there is no source to resolve it from: %w",
+					cvi.Spec.VolumeID, vmInstanceUUID, err)
+			}
+			log.Infof("reconcileDiskPathRefresh: volume %q is not attached to VM %q, so nothing can have "+
+				"relocated it since spec.diskPath=%q was recorded; treating the refresh as a no-op and "+
+				"clearing the annotation so the attach can proceed",
+				cvi.Spec.VolumeID, vmInstanceUUID, cvi.Spec.DiskPath)
+			return r.clearDiskPathRefreshRequested(ctx, cvi)
+		case err != nil:
 			return fmt.Errorf("reconcileDiskPathRefresh: QueryDiskPathFromVM failed for %q on VM %q: %w",
 				cvi.Spec.VolumeID, vmInstanceUUID, err)
 		}
@@ -906,13 +1112,73 @@ func (r *Reconciler) reconcileDiskPathRefresh(ctx context.Context,
 	}
 	log.Infof("reconcileDiskPathRefresh: patched spec.diskPath=%q for volume %q", livePath, cvi.Spec.VolumeID)
 
+	return r.clearDiskPathRefreshRequested(ctx, cvi)
+}
+
+// recordObservedGeneration republishes status with observedGeneration set to
+// the current metadata.generation, preserving ownership, phase and the Ready
+// condition exactly as they are. It is a no-op when status is already current.
+//
+// This exists because observedGeneration is a two-party contract, not
+// bookkeeping: vm-operator gates its attach on
+// observedGeneration >= generation (IsGreenSignal), so a generation this
+// controller has seen and deliberately taken no action on must still be
+// acknowledged. Every action branch records its own generation as part of the
+// status write it already makes; only the idle branches had no such write.
+func (r *Reconciler) recordObservedGeneration(ctx context.Context,
+	cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
+	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+
+	if cvi.Status.ObservedGeneration >= cvi.Generation {
+		return nil
+	}
+	// Ownership "" is not a settled state — the initial-status branch owns
+	// that transition, and claiming to have observed the generation here would
+	// race it.
+	if cvi.Status.Ownership == "" {
+		return nil
+	}
+
+	log.Infof("recordObservedGeneration: %q is idle at generation=%d but status reports "+
+		"observedGeneration=%d; republishing status so vm-operator's green signal can be satisfied",
+		cvi.Spec.VolumeID, cvi.Generation, cvi.Status.ObservedGeneration)
+
+	ready := readyCondition(cvi)
+	reason := reasonInitialCSIManaged
+	message := ""
+	condReady := true
+	if ready != nil {
+		reason = ready.Reason
+		message = ready.Message
+		condReady = ready.Status == metav1.ConditionTrue
+	}
+	patch := buildStatusPatch(cvi.Generation, cvi.Status.Ownership, cvi.Status.Phase,
+		cvi.Status.Error, message, reason, condReady)
+	if err := r.cviSvc.PatchCsiVolumeInfoStatus(ctx, cvi.Spec.VolumeID, patch); err != nil {
+		return fmt.Errorf("recordObservedGeneration: failed to patch status for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+	return nil
+}
+
+// clearDiskPathRefreshRequested removes DiskPathRefreshRequestedAnnotation.
+//
+// This is the only exit from the refresh state, and every path through
+// reconcileDiskPathRefresh must reach it — vm-operator treats the
+// annotation's presence as "spec.diskPath cannot be trusted" and will not
+// attach the disk while it is set, so an early return that leaves it in place
+// stalls the attach indefinitely.
+func (r *Reconciler) clearDiskPathRefreshRequested(ctx context.Context,
+	cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
+	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+
 	removeAnnotationPatch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{"%s":null}}}`,
 		csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation))
 	if _, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, removeAnnotationPatch); err != nil {
-		return fmt.Errorf("reconcileDiskPathRefresh: failed to clear %s for %q: %w",
+		return fmt.Errorf("clearDiskPathRefreshRequested: failed to clear %s for %q: %w",
 			csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, cvi.Spec.VolumeID, err)
 	}
-	log.Infof("reconcileDiskPathRefresh: cleared %s for volume %q",
+	log.Infof("clearDiskPathRefreshRequested: cleared %s for volume %q",
 		csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation, cvi.Spec.VolumeID)
 	return nil
 }
@@ -944,14 +1210,43 @@ func (r *Reconciler) reconcileRegister(ctx context.Context,
 	}
 	log.Infof("reconcileRegister: starting for volume %q (diskPath=%q)", cvi.Spec.VolumeID, cvi.Spec.DiskPath)
 
-	// Fetch PVC.
+	// Fetch PVC. A missing PVC must not be fatal.
+	//
+	// The webhook refuses to delete a PVC whose volume is VMManaged, but that
+	// is a per-object admission check and namespace teardown does not go
+	// through it: WCP/GC deletes the contents of a terminating namespace
+	// directly, so the PVC can and does vanish while the CVI is still
+	// VMManaged. Once that happens this Get can never succeed again, and
+	// because reconcileRegister is the only route to finishRelease — the only
+	// place the volume-protection finalizer is removed — treating it as an
+	// error stranded the CVI permanently: finalizer held forever, and the PV
+	// behind it undeletable via its blockOwnerDeletion ownerRef. An
+	// unrecoverable state reachable by an ordinary `kubectl delete namespace`.
+	//
+	// The PVC is needed for exactly one thing below: pvcMeta's name, namespace
+	// and labels. Two of those three are already recorded on the CVI spec, and
+	// the labels are CNS metadata for a claim that no longer exists — nothing
+	// consumes them for a volume on its way out. So re-register with the
+	// recorded identity and no labels, which lets the volume reach CSIManaged,
+	// drop its finalizer, and be cleaned up by the normal CSI delete path.
+	var pvcName, pvcNamespace string
+	var pvcLabels map[string]string
 	pvc := &corev1.PersistentVolumeClaim{}
 	if err := r.client.Get(ctx, k8stypes.NamespacedName{
 		Namespace: cvi.Spec.PVCNamespace,
 		Name:      cvi.Spec.PVCName,
 	}, pvc); err != nil {
-		return fmt.Errorf("reconcileRegister: failed to get PVC %s/%s: %w",
-			cvi.Spec.PVCNamespace, cvi.Spec.PVCName, err)
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("reconcileRegister: failed to get PVC %s/%s: %w",
+				cvi.Spec.PVCNamespace, cvi.Spec.PVCName, err)
+		}
+		log.Infof("reconcileRegister: PVC %s/%s is already gone (namespace teardown bypasses the "+
+			"per-PVC admission check); re-registering %q from the identity recorded on the CVI with no "+
+			"labels so the volume can still be released",
+			cvi.Spec.PVCNamespace, cvi.Spec.PVCName, cvi.Spec.VolumeID)
+		pvcName, pvcNamespace = cvi.Spec.PVCName, cvi.Spec.PVCNamespace
+	} else {
+		pvcName, pvcNamespace, pvcLabels = pvc.Name, pvc.Namespace, pvc.Labels
 	}
 
 	// Fetch PV.
@@ -983,9 +1278,9 @@ func (r *Reconciler) reconcileRegister(ctx context.Context,
 		pv.Name, "", clusterID)
 
 	pvcMeta := cnsvsphere.GetCnsKubernetesEntityMetaData(
-		pvc.Name, pvc.Labels, false,
+		pvcName, pvcLabels, false,
 		string(cnstypes.CnsKubernetesEntityTypePVC),
-		pvc.Namespace, clusterID,
+		pvcNamespace, clusterID,
 		[]cnstypes.CnsKubernetesEntityReference{pvRef})
 
 	pvMeta := cnsvsphere.GetCnsKubernetesEntityMetaData(
@@ -1046,32 +1341,158 @@ func (r *Reconciler) reconcileRegister(ctx context.Context,
 	return r.finishRelease(ctx, cvi)
 }
 
+// clearStrayVolumeProtectionFinalizer removes a VolumeProtectionFinalizer
+// that has no remaining reason to exist: no dependent VM is attached, the
+// volume is not VMManaged, and no reconcile ever reached UnregisterVolumeEx
+// for it. That combination is only reachable one way — reconcileUnregister
+// added the finalizer, then the attach was cancelled (vm-operator emptied
+// spec.vms) before the reconcile could either make the destructive call or
+// land its status flip. Nothing else will ever clean it up: finishRelease is
+// only reachable from reconcileRegister, which requires ownership==VMManaged,
+// so the volume settles into the initial-CSIManaged or idle branch of the
+// decision table with a permanent finalizer, and a permanently undeletable
+// PV behind it.
+//
+// The correctness of this rests entirely on the unregister-attempted
+// annotation being a separate bit from the finalizer. Gating on
+// "!hasDependent && ownership != VMManaged" alone is NOT safe — a reconcile
+// that is at this moment inside UnregisterVolumeEx has both of those
+// properties from a cached reader's point of view, and stripping its
+// finalizer would erase the evidence its own crash-recovery path depends on,
+// letting it converge to VMManaged with nothing blocking GC. With the
+// annotation in the gate, the only window where this fires is the window
+// where no destructive call has happened or is about to: if a concurrent
+// reconcile has written the marker, this returns early, and if it has not
+// written the marker it has not called UnregisterVolumeEx either and will
+// re-add the finalizer itself when it gets there.
+//
+// Both reads that decide this must come from the API server, not the cache:
+// the whole point is that the cached view of a concurrent reconcile's writes
+// may be stale, and a stale "no marker" is exactly the misread that would
+// make this unsafe. The write is optimistic-locked on that live read, so a
+// concurrent writer wins and this reconcile requeues.
+//
+// On top of that, the FCD's continued existence is confirmed by a live query
+// before the write — see the QueryLiveDiskPath call below for why inference
+// from the marker alone is not enough for pre-existing CVIs.
+//
+// Returns true when the caller should requeue rather than continue.
+func (r *Reconciler) clearStrayVolumeProtectionFinalizer(ctx context.Context,
+	cvi *csivolumeinfov1alpha1.CsiVolumeInfo, hasDependent bool) (bool, error) {
+	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
+
+	// Cheap precondition on the cached object, purely to keep the live read
+	// off the common path. Every condition is re-checked below.
+	if !hasVolumeProtectionFinalizer(cvi) || hasDependent ||
+		cvi.Status.Ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged ||
+		hasUnregisterAttempted(cvi) {
+		return false, nil
+	}
+
+	live := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	if err := r.apiReader.Get(ctx, k8stypes.NamespacedName{
+		Namespace: cvi.Namespace,
+		Name:      cvi.Name,
+	}, live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("clearStrayVolumeProtectionFinalizer: live read failed for %q: %w",
+			cvi.Spec.VolumeID, err)
+	}
+
+	if !hasVolumeProtectionFinalizer(live) || hasDependentEntry(ctx, live.Spec.VMs) ||
+		live.Status.Ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged ||
+		hasUnregisterAttempted(live) {
+		log.Infof("clearStrayVolumeProtectionFinalizer: cached state suggested a stray finalizer on %q "+
+			"but the live object disagrees (finalizer=%t hasDependent=%t ownership=%q attempted=%t); "+
+			"leaving it alone", cvi.Spec.VolumeID, hasVolumeProtectionFinalizer(live),
+			hasDependentEntry(ctx, live.Spec.VMs), live.Status.Ownership, hasUnregisterAttempted(live))
+		return false, nil
+	}
+
+	// Positive confirmation before a destructive-to-invariants write: the FCD
+	// must still exist. A successful live query proves the volume was never
+	// unregistered, so the finalizer is genuinely stray and removing it cannot
+	// unblock GC on a disk that has left CSI's hands.
+	//
+	// Absence of the marker is nearly, but not quite, sufficient on its own.
+	// For a CVI written before the marker existed, "no marker" carries no
+	// information: a legacy object stranded with a completed unregister and a
+	// failed status flip, whose VM then detached, is indistinguishable from a
+	// legacy cancelled attach — and stripping the finalizer in the first case
+	// is exactly the VMManaged-with-no-protection outcome this whole change
+	// exists to make impossible. Rather than infer, ask.
+	//
+	// NotFound (or any query error) therefore means leave it alone. That
+	// forgoes cleaning up some strays, which is the right way to be wrong
+	// here: a leaked finalizer is a visible, manually repairable nuisance,
+	// while an unprotected VM-owned disk is silent data risk.
+	if _, err := r.volumeManager.QueryLiveDiskPath(ctx, cvi.Spec.VolumeID); err != nil {
+		log.Infof("clearStrayVolumeProtectionFinalizer: %q looks like a stray finalizer, but its FCD "+
+			"could not be confirmed to still exist (%v); leaving the finalizer in place rather than "+
+			"risk unprotecting an already-unregistered disk", cvi.Spec.VolumeID, err)
+		return false, nil
+	}
+
+	log.Infof("clearStrayVolumeProtectionFinalizer: %q carries a volume-protection finalizer with no "+
+		"dependent VM, ownership=%q, no unregister attempt on record, and a still-registered FCD — "+
+		"an attach was cancelled before ownership transfer began; removing it",
+		cvi.Spec.VolumeID, live.Status.Ownership)
+	if err := r.cviSvc.RemoveStrayVolumeProtectionFinalizer(ctx, live); err != nil {
+		if apierrors.IsConflict(err) {
+			log.Infof("clearStrayVolumeProtectionFinalizer: lost the optimistic lock on %q to a "+
+				"concurrent writer; requeueing: %v", cvi.Spec.VolumeID, err)
+			return true, nil
+		}
+		return false, fmt.Errorf("clearStrayVolumeProtectionFinalizer: failed to remove finalizer "+
+			"from %q: %w", cvi.Spec.VolumeID, err)
+	}
+	return false, nil
+}
+
 // finishRelease flips the CVI back to CSIManaged/Succeeded and removes the
 // volume-protection finalizer — the common tail of both the fcd-retained
 // skip branch and a completed re-register, kept as one helper so the two
-// paths cannot drift apart. Clears the fcd-retained annotation first, if
-// present, so status.ownership never reads CSIManaged while the annotation
-// still claims the FCD is retained.
+// paths cannot drift apart. Clears the fcd-retained and unregister-attempted
+// annotations first, if present, so status.ownership never reads CSIManaged
+// while the annotations still claim the FCD is retained or unregistered.
+//
+// Clearing unregister-attempted before (not after) the finalizer removal is
+// the safe ordering: the intermediate state a concurrent reconcile can
+// observe is "no marker, finalizer still present", which is exactly the state
+// clearStrayVolumeProtectionFinalizer is there to finish off. The reverse
+// order would expose "marker set, no finalizer" — a state that would send
+// reconcileUnregister's crash-recovery path to VMManaged with nothing
+// blocking GC.
 func (r *Reconciler) finishRelease(ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
 	log := logger.GetLogger(ctx).With("volumeID", cvi.Spec.VolumeID)
 
-	if _, retained := cvi.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation]; retained {
+	_, retained := cvi.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation]
+	marked := hasUnregisterAttempted(cvi)
+	if retained || marked {
+		annotations := map[string]interface{}{}
+		if retained {
+			annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation] = nil
+		}
+		if marked {
+			annotations[csivolumeinfov1alpha1.UnregisterAttemptedAnnotation] = nil
+		}
 		annotationPatch, err := json.Marshal(map[string]interface{}{
 			"metadata": map[string]interface{}{
-				"annotations": map[string]interface{}{
-					csivolumeinfov1alpha1.FcdRetainedAnnotation: nil,
-				},
+				"annotations": annotations,
 			},
 		})
 		if err != nil {
-			return fmt.Errorf("finishRelease: failed to marshal fcd-retained clear patch for %q: %w",
+			return fmt.Errorf("finishRelease: failed to marshal annotation clear patch for %q: %w",
 				cvi.Spec.VolumeID, err)
 		}
 		if _, err := r.cviSvc.PatchCsiVolumeInfo(ctx, cvi.Spec.VolumeID, annotationPatch); err != nil {
-			return fmt.Errorf("finishRelease: failed to clear fcd-retained annotation for %q: %w",
+			return fmt.Errorf("finishRelease: failed to clear annotations for %q: %w",
 				cvi.Spec.VolumeID, err)
 		}
-		log.Infof("finishRelease: fcd-retained annotation cleared for volume %q", cvi.Spec.VolumeID)
+		log.Infof("finishRelease: cleared annotations (fcd-retained=%t unregister-attempted=%t) "+
+			"for volume %q", retained, marked, cvi.Spec.VolumeID)
 	}
 
 	statusPatch := buildStatusPatch(cvi.Generation,

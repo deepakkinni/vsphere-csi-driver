@@ -991,6 +991,11 @@ func (m *mockVolumeManagerForFullSync) QueryLiveDiskPath(ctx context.Context, vo
 	return "", nil
 }
 
+func (m *mockVolumeManagerForFullSync) QueryDiskPathFromVM(ctx context.Context,
+	vmInstanceUUID, diskUUID string) (string, error) {
+	return "", nil
+}
+
 func (m *mockVolumeManagerForFullSync) QueryUnregisterFeasibility(ctx context.Context,
 	volumeIDs []string) ([]volumes.UnregisterFeasibility, error) {
 	return nil, nil

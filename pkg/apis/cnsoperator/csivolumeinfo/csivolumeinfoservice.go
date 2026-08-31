@@ -82,13 +82,42 @@ type CsiVolumeInfoService interface {
 	// given volumeID.
 	CsiVolumeInfoExists(ctx context.Context, volumeID string) (bool, error)
 
-	// AddVolumeProtectionFinalizer adds the volume-protection finalizer to the
-	// CsiVolumeInfo for the given volumeID. Idempotent: no-op if already present.
-	AddVolumeProtectionFinalizer(ctx context.Context, volumeID string) error
+	// MarkUnregisterInFlight adds the volume-protection finalizer and the
+	// unregister-attempted annotation to the CsiVolumeInfo for the given
+	// volumeID, in a single metadata patch. Idempotent.
+	//
+	// The two are written together, never separately, and this is the only
+	// way to add VolumeProtectionFinalizer: the annotation is what makes a
+	// stray finalizer safely removable (see UnregisterAttemptedAnnotation),
+	// and that only holds if a finalizer can never exist without its
+	// annotation having been written first-or-together. One patch, so they
+	// cannot diverge even if the caller dies immediately afterward.
+	MarkUnregisterInFlight(ctx context.Context, volumeID string) error
 
 	// RemoveVolumeProtectionFinalizer removes the volume-protection finalizer from the
 	// CsiVolumeInfo for the given volumeID. Idempotent: no-op if already absent.
+	//
+	// Use this only on the legitimate release path, where the caller has
+	// already established that the volume is going back to CSIManaged. To
+	// strip a finalizer that was left behind by an abandoned transfer, use
+	// RemoveStrayVolumeProtectionFinalizer, which is guarded against racing
+	// a concurrent transfer.
 	RemoveVolumeProtectionFinalizer(ctx context.Context, volumeID string) error
+
+	// RemoveStrayVolumeProtectionFinalizer removes the volume-protection
+	// finalizer from the supplied object using an optimistic-lock patch, so
+	// the write fails with a conflict rather than clobbering a concurrent
+	// writer. Callers must pass an object obtained from a live, uncached read
+	// and must handle apierrors.IsConflict by requeueing.
+	//
+	// Separate from RemoveVolumeProtectionFinalizer because the plain variant
+	// re-reads through whatever client the service was built with — for the
+	// csivolumeinfo controller that is the manager's cached client — and then
+	// issues a blind merge patch. That is fine when the caller already owns
+	// the transition, and unsafe when the caller is second-guessing another
+	// reconcile's in-flight work.
+	RemoveStrayVolumeProtectionFinalizer(
+		ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error
 }
 
 // csiVolumeInfoSvc is the concrete singleton implementing CsiVolumeInfoService.
@@ -322,36 +351,71 @@ func (s *csiVolumeInfoSvc) CsiVolumeInfoExists(
 	return cvi != nil, nil
 }
 
-// AddVolumeProtectionFinalizer adds the volume-protection finalizer to the CsiVolumeInfo
-// identified by volumeID. The operation is idempotent.
-func (s *csiVolumeInfoSvc) AddVolumeProtectionFinalizer(
+// MarkUnregisterInFlight adds the volume-protection finalizer and the
+// unregister-attempted annotation to the CsiVolumeInfo identified by volumeID
+// in one metadata patch. The operation is idempotent.
+func (s *csiVolumeInfoSvc) MarkUnregisterInFlight(
 	ctx context.Context, volumeID string) error {
 	log := logger.GetLogger(ctx)
 	name := GetCsiVolumeInfoCRName(volumeID)
 
 	cvi, err := s.GetCsiVolumeInfo(ctx, volumeID)
 	if err != nil {
-		return fmt.Errorf("AddVolumeProtectionFinalizer: failed to fetch CsiVolumeInfo %s/%s: %w",
+		return fmt.Errorf("MarkUnregisterInFlight: failed to fetch CsiVolumeInfo %s/%s: %w",
 			csivolumeinfov1alpha1.CVINamespace, name, err)
 	}
 	if cvi == nil {
-		return fmt.Errorf("AddVolumeProtectionFinalizer: CsiVolumeInfo %s/%s not found",
+		return fmt.Errorf("MarkUnregisterInFlight: CsiVolumeInfo %s/%s not found",
 			csivolumeinfov1alpha1.CVINamespace, name)
 	}
-	if controllerutil.ContainsFinalizer(cvi, csivolumeinfov1alpha1.VolumeProtectionFinalizer) {
-		log.Infof("AddVolumeProtectionFinalizer: finalizer already present on CsiVolumeInfo %s/%s",
-			csivolumeinfov1alpha1.CVINamespace, name)
+
+	_, marked := cvi.Annotations[csivolumeinfov1alpha1.UnregisterAttemptedAnnotation]
+	hasFinalizer := controllerutil.ContainsFinalizer(cvi,
+		csivolumeinfov1alpha1.VolumeProtectionFinalizer)
+	if marked && hasFinalizer {
+		log.Infof("MarkUnregisterInFlight: finalizer and unregister-attempted annotation "+
+			"already present on CsiVolumeInfo %s/%s", csivolumeinfov1alpha1.CVINamespace, name)
 		return nil
 	}
 
 	patch := client.MergeFrom(cvi.DeepCopy())
 	controllerutil.AddFinalizer(cvi, csivolumeinfov1alpha1.VolumeProtectionFinalizer)
+	if cvi.Annotations == nil {
+		cvi.Annotations = map[string]string{}
+	}
+	cvi.Annotations[csivolumeinfov1alpha1.UnregisterAttemptedAnnotation] = "true"
 	if err := s.k8sClient.Patch(ctx, cvi, patch); err != nil {
-		return fmt.Errorf("AddVolumeProtectionFinalizer: failed to patch CsiVolumeInfo %s/%s: %w",
+		return fmt.Errorf("MarkUnregisterInFlight: failed to patch CsiVolumeInfo %s/%s: %w",
 			csivolumeinfov1alpha1.CVINamespace, name, err)
 	}
-	log.Infof("AddVolumeProtectionFinalizer: added finalizer on CsiVolumeInfo %s/%s",
-		csivolumeinfov1alpha1.CVINamespace, name)
+	log.Infof("MarkUnregisterInFlight: added volume-protection finalizer and unregister-attempted "+
+		"annotation on CsiVolumeInfo %s/%s", csivolumeinfov1alpha1.CVINamespace, name)
+	return nil
+}
+
+// RemoveStrayVolumeProtectionFinalizer removes the volume-protection finalizer
+// from the supplied object under an optimistic lock. cvi must come from a live
+// read; a conflict error is returned verbatim for the caller to requeue on.
+func (s *csiVolumeInfoSvc) RemoveStrayVolumeProtectionFinalizer(
+	ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
+	log := logger.GetLogger(ctx)
+
+	if !controllerutil.ContainsFinalizer(cvi, csivolumeinfov1alpha1.VolumeProtectionFinalizer) {
+		log.Infof("RemoveStrayVolumeProtectionFinalizer: finalizer absent on CsiVolumeInfo %s/%s; no-op",
+			cvi.Namespace, cvi.Name)
+		return nil
+	}
+
+	patch := client.MergeFromWithOptions(cvi.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	controllerutil.RemoveFinalizer(cvi, csivolumeinfov1alpha1.VolumeProtectionFinalizer)
+	if err := s.k8sClient.Patch(ctx, cvi, patch); err != nil {
+		// Deliberately not wrapped with %w-into-a-new-sentence only: callers
+		// test this with apierrors.IsConflict, which unwraps.
+		return fmt.Errorf("RemoveStrayVolumeProtectionFinalizer: failed to patch CsiVolumeInfo %s/%s: %w",
+			cvi.Namespace, cvi.Name, err)
+	}
+	log.Infof("RemoveStrayVolumeProtectionFinalizer: removed stray finalizer from CsiVolumeInfo %s/%s",
+		cvi.Namespace, cvi.Name)
 	return nil
 }
 
