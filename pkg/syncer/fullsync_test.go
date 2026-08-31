@@ -977,6 +977,30 @@ func (m *mockVolumeManagerForFullSync) UnregisterVolume(
 	return "", nil
 }
 
+func (m *mockVolumeManagerForFullSync) UnregisterVolumeEx(
+	ctx context.Context, volumeID string,
+) (string, string, string, error) {
+	return "", "", "", nil
+}
+
+func (m *mockVolumeManagerForFullSync) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManagerForFullSync) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManagerForFullSync) QueryDiskPathFromVM(ctx context.Context,
+	vmInstanceUUID, diskUUID string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManagerForFullSync) QueryUnregisterFeasibility(ctx context.Context,
+	volumeIDs []string) ([]volumes.UnregisterFeasibility, error) {
+	return nil, nil
+}
+
 // TestCNSQueryBatching tests CNS query batching logic
 func TestCNSQueryBatching_VaryingBatchSizes(t *testing.T) {
 	if testing.Short() {

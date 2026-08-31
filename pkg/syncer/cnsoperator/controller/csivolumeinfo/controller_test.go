@@ -1,0 +1,2795 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package csivolumeinfo
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	cnstypes "github.com/vmware/govmomi/cns/types"
+	"github.com/vmware/govmomi/object"
+	vim25types "github.com/vmware/govmomi/vim25/types"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	csivolumeinfosvc "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
+	cnsvolumes "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/volume"
+	cnsvsphere "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/vsphere"
+	commonconfig "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/config"
+	cnsvolumeoperationrequest "sigs.k8s.io/vsphere-csi-driver/v3/pkg/internalapis/cnsvolumeoperationrequest"
+)
+
+// ---------------------------------------------------------------------------
+// fakeCsiVolumeInfoService — in-process service backed by a fake client.
+// ---------------------------------------------------------------------------
+
+// fakeCsiVolumeInfoService wraps a controller-runtime fake client and provides
+// the CsiVolumeInfoService interface for tests.  Its methods are thin delegates
+// to the concrete service implementation so we exercise real service logic.
+type fakeCsiVolumeInfoService struct {
+	inner csivolumeinfosvc.CsiVolumeInfoService
+}
+
+func newFakeCviService(c client.Client) csivolumeinfosvc.CsiVolumeInfoService {
+	return &fakeCsiVolumeInfoService{inner: csivolumeinfosvc.NewCsiVolumeInfoService(c)}
+}
+
+func (f *fakeCsiVolumeInfoService) CreateCsiVolumeInfo(
+	ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
+	return f.inner.CreateCsiVolumeInfo(ctx, cvi)
+}
+
+func (f *fakeCsiVolumeInfoService) GetCsiVolumeInfo(
+	ctx context.Context, volumeID string) (*csivolumeinfov1alpha1.CsiVolumeInfo, error) {
+	return f.inner.GetCsiVolumeInfo(ctx, volumeID)
+}
+
+func (f *fakeCsiVolumeInfoService) UpdateCsiVolumeInfoStatus(
+	ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
+	return f.inner.UpdateCsiVolumeInfoStatus(ctx, cvi)
+}
+
+func (f *fakeCsiVolumeInfoService) PatchCsiVolumeInfo(
+	ctx context.Context, volumeID string, patchBytes []byte) (int64, error) {
+	return f.inner.PatchCsiVolumeInfo(ctx, volumeID, patchBytes)
+}
+
+func (f *fakeCsiVolumeInfoService) PatchCsiVolumeInfoStatus(
+	ctx context.Context, volumeID string, patchBytes []byte) error {
+	return f.inner.PatchCsiVolumeInfoStatus(ctx, volumeID, patchBytes)
+}
+
+func (f *fakeCsiVolumeInfoService) DeleteCsiVolumeInfo(
+	ctx context.Context, volumeID string) error {
+	return f.inner.DeleteCsiVolumeInfo(ctx, volumeID)
+}
+
+func (f *fakeCsiVolumeInfoService) CsiVolumeInfoExists(
+	ctx context.Context, volumeID string) (bool, error) {
+	return f.inner.CsiVolumeInfoExists(ctx, volumeID)
+}
+
+func (f *fakeCsiVolumeInfoService) MarkUnregisterInFlight(
+	ctx context.Context, volumeID string) error {
+	return f.inner.MarkUnregisterInFlight(ctx, volumeID)
+}
+
+func (f *fakeCsiVolumeInfoService) RemoveVolumeProtectionFinalizer(
+	ctx context.Context, volumeID string) error {
+	return f.inner.RemoveVolumeProtectionFinalizer(ctx, volumeID)
+}
+
+func (f *fakeCsiVolumeInfoService) RemoveStrayVolumeProtectionFinalizer(
+	ctx context.Context, cvi *csivolumeinfov1alpha1.CsiVolumeInfo) error {
+	return f.inner.RemoveStrayVolumeProtectionFinalizer(ctx, cvi)
+}
+
+// genBumpingCviService simulates the API server incrementing metadata.generation
+// on a spec patch.  It applies the patch through the wrapped service but reports a
+// higher generation than the fake store actually records (the controller-runtime
+// fake client does not bump generation on a patch).  This lets a test verify that
+// the reconciler records observedGeneration from the patch result rather than from
+// the generation observed at reconcile entry.
+type genBumpingCviService struct {
+	csivolumeinfosvc.CsiVolumeInfoService
+	bumpedGen int64
+}
+
+func (g *genBumpingCviService) PatchCsiVolumeInfo(
+	ctx context.Context, volumeID string, patchBytes []byte) (int64, error) {
+	if _, err := g.CsiVolumeInfoService.PatchCsiVolumeInfo(ctx, volumeID, patchBytes); err != nil {
+		return 0, err
+	}
+	return g.bumpedGen, nil
+}
+
+// ---------------------------------------------------------------------------
+// testVolumeManager — fully configurable mock for the Manager interface.
+// ---------------------------------------------------------------------------
+
+// testVolumeManager is a test-scoped implementation of volumes.Manager that
+// lets each test control the behaviour of QueryLiveDiskPath, UnregisterVolumeEx,
+// QueryUnregisterFeasibility, and CreateVolume independently.
+type testVolumeManager struct {
+	queryLiveDiskPathFn          func(ctx context.Context, volumeID string) (string, error)
+	queryDiskPathFromVMFn        func(ctx context.Context, vmInstanceUUID, diskUUID string) (string, error)
+	unregisterVolumeExFn         func(ctx context.Context, volumeID string) (string, string, string, error)
+	queryUnregisterFeasibilityFn func(ctx context.Context,
+		volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error)
+	createVolumeFn func(ctx context.Context, spec *cnstypes.CnsVolumeCreateSpec,
+		extraParams interface{}) (*cnsvolumes.CnsVolumeInfo, string, error)
+	getDiskFolderURLFn func(ctx context.Context, datastorePath string) (string, error)
+}
+
+func (m *testVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	if m.queryLiveDiskPathFn != nil {
+		return m.queryLiveDiskPathFn(ctx, volumeID)
+	}
+	return "test-live-disk-path", nil
+}
+
+func (m *testVolumeManager) QueryDiskPathFromVM(ctx context.Context, vmInstanceUUID, diskUUID string) (string, error) {
+	if m.queryDiskPathFromVMFn != nil {
+		return m.queryDiskPathFromVMFn(ctx, vmInstanceUUID, diskUUID)
+	}
+	return "test-live-disk-path", nil
+}
+
+func (m *testVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, string, error) {
+	if m.unregisterVolumeExFn != nil {
+		return m.unregisterVolumeExFn(ctx, volumeID)
+	}
+	return "test-disk-path", "test-disk-uuid", "", nil
+}
+
+func (m *testVolumeManager) QueryUnregisterFeasibility(ctx context.Context,
+	volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+	if m.queryUnregisterFeasibilityFn != nil {
+		return m.queryUnregisterFeasibilityFn(ctx, volumeIDs)
+	}
+	return nil, nil
+}
+
+func (m *testVolumeManager) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
+	if m.getDiskFolderURLFn != nil {
+		return m.getDiskFolderURLFn(ctx, datastorePath)
+	}
+	return "", nil
+}
+
+func (m *testVolumeManager) CreateVolume(ctx context.Context, spec *cnstypes.CnsVolumeCreateSpec,
+	extraParams interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+	if m.createVolumeFn != nil {
+		return m.createVolumeFn(ctx, spec, extraParams)
+	}
+	return &cnsvolumes.CnsVolumeInfo{}, "", nil
+}
+
+// Remaining Manager interface methods — not exercised by these tests.
+func (m *testVolumeManager) AttachVolume(ctx context.Context, vm *cnsvsphere.VirtualMachine,
+	volumeID string, checkNVMeController bool) (string, string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) DetachVolume(ctx context.Context, vm *cnsvsphere.VirtualMachine,
+	volumeID string) (string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) DeleteVolume(ctx context.Context, volumeID string,
+	deleteDisk bool) (string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) UpdateVolumeMetadata(ctx context.Context,
+	spec *cnstypes.CnsVolumeMetadataUpdateSpec) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) UpdateVolumeCrypto(ctx context.Context,
+	spec *cnstypes.CnsVolumeCryptoUpdateSpec) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) QueryVolumeInfo(ctx context.Context,
+	volumeIDList []cnstypes.CnsVolumeId) (*cnstypes.CnsQueryVolumeInfoResult, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) QueryAllVolume(ctx context.Context, queryFilter cnstypes.CnsQueryFilter,
+	querySelection cnstypes.CnsQuerySelection) (*cnstypes.CnsQueryResult, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) QueryVolumeAsync(ctx context.Context, queryFilter cnstypes.CnsQueryFilter,
+	querySelection *cnstypes.CnsQuerySelection) (*cnstypes.CnsQueryResult, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) QueryVolume(ctx context.Context,
+	queryFilter cnstypes.CnsQueryFilter) (*cnstypes.CnsQueryResult, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) RelocateVolume(ctx context.Context,
+	relocateSpecList ...cnstypes.BaseCnsVolumeRelocateSpec) (*object.Task, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) ExpandVolume(ctx context.Context, volumeID string, size int64,
+	extraParams interface{}) (string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) ResetManager(ctx context.Context, vcenter *cnsvsphere.VirtualCenter) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) ConfigureVolumeACLs(ctx context.Context,
+	spec cnstypes.CnsVolumeACLConfigureSpec) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) RegisterDisk(ctx context.Context, path string, name string) (string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) RetrieveVStorageObject(ctx context.Context,
+	volumeID string) (*vim25types.VStorageObject, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) ProtectVolumeFromVMDeletion(ctx context.Context, volumeID string) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) UnprotectVolumeFromVMDeletion(ctx context.Context, volumeID string) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) SetVolumeControlFlags(ctx context.Context, volumeID string,
+	controlFlags []string) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) ClearVolumeControlFlags(ctx context.Context, volumeID string,
+	controlFlags []string) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) CreateSnapshot(ctx context.Context, volumeID string, desc string,
+	extraParams interface{}) (*cnsvolumes.CnsSnapshotInfo, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) DeleteSnapshot(ctx context.Context, volumeID string, snapshotID string,
+	extraParams interface{}) (*cnsvolumes.CnsSnapshotInfo, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) QuerySnapshots(ctx context.Context,
+	snapshotQueryFilter cnstypes.CnsSnapshotQueryFilter) (*cnstypes.CnsSnapshotQueryResult, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) MonitorCreateVolumeTask(ctx context.Context,
+	details **cnsvolumeoperationrequest.VolumeOperationRequestDetails, task *object.Task,
+	volNameFromInputSpec, clusterID string) (*cnsvolumes.CnsVolumeInfo, string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) GetOperationStore() cnsvolumeoperationrequest.VolumeOperationRequest {
+	panic("not implemented")
+}
+func (m *testVolumeManager) IsListViewReady() bool                   { return true }
+func (m *testVolumeManager) SetListViewNotReady(ctx context.Context) {}
+func (m *testVolumeManager) BatchAttachVolumes(ctx context.Context, vm *cnsvsphere.VirtualMachine,
+	batchAttachRequest []cnsvolumes.BatchAttachRequest) ([]cnsvolumes.BatchAttachResult, string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) UnregisterVolume(ctx context.Context, volumeID string,
+	unregisterDisk bool) (string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) SyncVolume(ctx context.Context,
+	syncVolumeSpecs []cnstypes.CnsSyncVolumeSpec) (string, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) ReRegisterVolume(ctx context.Context, volumeID string) error {
+	panic("not implemented")
+}
+func (m *testVolumeManager) QueryFCDAllocatedBlocks(ctx context.Context,
+	volumeID, snapshotID string, startingOffset uint64) (
+	[]cnsvolumes.DiskArea, uint64, error) {
+	panic("not implemented")
+}
+func (m *testVolumeManager) QueryFCDChangedBlocks(ctx context.Context,
+	volumeID, targetSnapshotID, baseChangeID string, startingOffset uint64) (
+	[]cnsvolumes.DiskArea, uint64, error) {
+	panic("not implemented")
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func newScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	require.NoError(t, csivolumeinfov1alpha1.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+	require.NoError(t, storagev1.AddToScheme(s))
+	return s
+}
+
+func newFakeClient(t *testing.T, s *runtime.Scheme, objs []client.Object,
+	ifuncs interceptor.Funcs) client.Client {
+	t.Helper()
+	cb := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(objs...).
+		WithStatusSubresource(&csivolumeinfov1alpha1.CsiVolumeInfo{}).
+		WithInterceptorFuncs(ifuncs)
+	return cb.Build()
+}
+
+func minimalConfigInfo() *commonconfig.ConfigurationInfo {
+	cfg := &commonconfig.Config{
+		VirtualCenter: map[string]*commonconfig.VirtualCenterConfig{
+			"vcenter": {User: "test-user"},
+		},
+	}
+	cfg.Global.ClusterID = "test-cluster"
+	return &commonconfig.ConfigurationInfo{Cfg: cfg}
+}
+
+// newCVI creates a CsiVolumeInfo for testing.  The object is created in the
+// vmware-system-csi namespace which is the fixed namespace for all CVIs.
+func newCVI(volumeID string, vms []csivolumeinfov1alpha1.VirtualMachineRef,
+	ownership csivolumeinfov1alpha1.OwnershipState,
+	diskPath, diskUUID string,
+	generation int64,
+	finalizers []string) *csivolumeinfov1alpha1.CsiVolumeInfo {
+	cvi := &csivolumeinfov1alpha1.CsiVolumeInfo{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       csivolumeinfosvc.GetCsiVolumeInfoCRName(volumeID),
+			Namespace:  csivolumeinfov1alpha1.CVINamespace,
+			Generation: generation,
+			Finalizers: finalizers,
+		},
+		Spec: csivolumeinfov1alpha1.CsiVolumeInfoSpec{
+			VolumeID:     volumeID,
+			PVCName:      "test-pvc",
+			PVCNamespace: "test-ns",
+			PVName:       "test-pv",
+			DiskPath:     diskPath,
+			DiskUUID:     diskUUID,
+			VMs:          vms,
+		},
+		Status: csivolumeinfov1alpha1.CsiVolumeInfoStatus{
+			Ownership: ownership,
+		},
+	}
+	return cvi
+}
+
+func makeRequest(volumeID string) reconcile.Request {
+	return reconcile.Request{
+		NamespacedName: k8stypes.NamespacedName{
+			Namespace: csivolumeinfov1alpha1.CVINamespace,
+			Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volumeID),
+		},
+	}
+}
+
+func newTestPV(name string) *corev1.PersistentVolume {
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: "test-sc",
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:           "csi.vsphere.volume",
+					VolumeHandle:     "test-volume-id",
+					VolumeAttributes: map[string]string{"storagePolicyID": "test-policy"},
+				},
+			},
+		},
+	}
+}
+
+func newTestPVC(name, ns string) *corev1.PersistentVolumeClaim {
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// TestReconcile_NotFound verifies that a missing CVI is silently ignored
+// (no requeue, no error).
+func TestReconcile_NotFound(t *testing.T) {
+	s := newScheme(t)
+	c := newFakeClient(t, s, nil, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			return apierrors.NewNotFound(schema.GroupResource{
+				Group:    csivolumeinfov1alpha1.GroupName,
+				Resource: csivolumeinfov1alpha1.CRDSingular,
+			}, key.Name)
+		},
+	})
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: &testVolumeManager{},
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest("vol-001"))
+	assert.NoError(t, err)
+	assert.True(t, res.IsZero())
+}
+
+// TestReconcile_GetError verifies that a transient Get error is returned so the
+// controller-runtime framework requeues it.
+func TestReconcile_GetError(t *testing.T) {
+	s := newScheme(t)
+	c := newFakeClient(t, s, nil, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			return errors.New("transient error")
+		},
+	})
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: &testVolumeManager{},
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	_, err := r.Reconcile(context.Background(), makeRequest("vol-001"))
+	assert.Error(t, err)
+}
+
+// TestReconcile_UnregisterTransition verifies the full unregister path:
+// spec.vms=[vmA], ownership="" → UnregisterVolumeEx called, spec.diskPath/diskUUID
+// patched, protection finalizer added, status.ownership=VMManaged, phase=Succeeded,
+// observedGeneration matches.
+func TestReconcile_UnregisterTransition(t *testing.T) {
+	const volID = "vol-unregister"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "", "", 3, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, id string) (string, string, string, error) {
+			assert.Equal(t, volID, id)
+			return "/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+
+	// Read updated CVI from fake store.
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.Equal(t, "/vmfs/volumes/ds/disk.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, "disk-uuid-123", updated.Spec.DiskUUID)
+	assert.Contains(t, updated.Finalizers, csivolumeinfov1alpha1.VolumeProtectionFinalizer)
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	// observedGeneration must match the live generation (including any bump from the
+	// controller's own diskPath/diskUUID spec write) so the green signal is satisfiable.
+	assert.Equal(t, updated.Generation, updated.Status.ObservedGeneration)
+	assert.Empty(t, updated.Status.Error)
+}
+
+// TestReconcile_UnregisterCapturesLiveDiskPathBeforeUnregister verifies the
+// crash-recovery ordering: QueryLiveDiskPath is called and its result is
+// patched onto spec.diskPath strictly before UnregisterVolumeEx is called, so
+// a crash between the two still leaves the CVI holding a valid disk path.
+func TestReconcile_UnregisterCapturesLiveDiskPathBeforeUnregister(t *testing.T) {
+	const volID = "vol-ordering"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "", "", 3, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	var diskPathAtUnregisterTime string
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, id string) (string, error) {
+			assert.Equal(t, volID, id)
+			return "/vmfs/volumes/ds/live-tip.vmdk", nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, id string) (string, string, string, error) {
+			// By the time UnregisterVolumeEx runs, the live path must already be
+			// durable on the CVI — read it back from the fake store rather than
+			// trusting an in-memory ordering flag.
+			existing := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+			require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+				Namespace: csivolumeinfov1alpha1.CVINamespace,
+				Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+			}, existing))
+			diskPathAtUnregisterTime = existing.Spec.DiskPath
+			return "/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	_, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.Equal(t, "/vmfs/volumes/ds/live-tip.vmdk", diskPathAtUnregisterTime,
+		"spec.diskPath must hold the live-queried path at the moment UnregisterVolumeEx is called")
+}
+
+// TestReconcile_UnregisterLiveDiskPathFailureBlocksUnregister verifies that a
+// QueryLiveDiskPath failure (including NotFound, which the manager can return
+// transiently right after a storage vMotion) is treated as retryable: the
+// reconcile fails without ever calling UnregisterVolumeEx, and no disk path
+// is fabricated.
+func TestReconcile_UnregisterLiveDiskPathFailureBlocksUnregister(t *testing.T) {
+	const volID = "vol-live-path-notfound"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "", "", 3, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			return "", errors.New("NotFound")
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.False(t, res.IsZero(), "a live-path failure must requeue rather than drop the volume")
+	assert.False(t, unregisterCalled, "UnregisterVolumeEx must not run without a captured live path")
+}
+
+// TestReconcile_UnregisterConvergesOnRaceWhenAlreadyUnregistered reproduces the
+// VGL-62908 CSI-driver race: reconcileUnregister's own writes (two spec
+// patches, then a status patch) each advance metadata.generation and enqueue
+// a fresh reconcile for the same CVI. A racing second reconcile can start and
+// read a client-cache snapshot that predates the first reconcile's status
+// write — landing here with hasDependent=true and a stale ownership of ""/
+// CSIManaged, even though UnregisterVolumeEx has already run to completion.
+// That second reconcile calls QueryLiveDiskPath again, which now fails
+// permanently: the FCD no longer exists as a queryable object once
+// unregistered — a one-way transition, not a transient condition.
+//
+// UnregisterAttemptedAnnotation is only added, once, right before that
+// destructive call, so its presence on the object handed to this reconcile
+// (unlike status.ownership) is not subject to the same cache race. Its
+// presence here must make the reconciler treat the NotFound as confirmation
+// of a prior success and converge to VMManaged/Succeeded, instead of
+// spiralling into permanent backoff with phase=Failed while the volume is
+// already correctly VM-owned on the vCenter side.
+func TestReconcile_UnregisterConvergesOnRaceWhenAlreadyUnregistered(t *testing.T) {
+	const volID = "vol-race-already-unregistered"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	// Models the stale read the racing reconcile sees: hasDependent (vms set),
+	// ownership still "" (the first reconcile's VMManaged status write has not
+	// reached this reconcile's cache yet), but diskPath/diskUUID, the
+	// finalizer, and the unregister-attempted marker already reflect the first
+	// reconcile's completed work.
+	cvi := newCVI(volID, vms, "", "/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", 5,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{
+		csivolumeinfov1alpha1.UnregisterAttemptedAnnotation: "true",
+	}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, id string) (string, error) {
+			assert.Equal(t, volID, id)
+			return "", errors.New("ServerFaultCode: The object or item referred to could not be found")
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero(), "convergence is a success outcome; it must not requeue with backoff")
+	assert.False(t, unregisterCalled,
+		"UnregisterVolumeEx must not be re-attempted against an already-unregistered volume")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"must converge to VMManaged, not remain stuck at the stale CSIManaged/\"\" ownership")
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase,
+		"must not be left in phase=Failed for a disk that is already correctly VM-owned")
+	assert.Empty(t, updated.Status.Error)
+	// diskPath/diskUUID from the earlier successful run must be preserved untouched.
+	assert.Equal(t, "/vmfs/volumes/ds/disk.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, "disk-uuid-123", updated.Spec.DiskUUID)
+	// The finalizer must still be there: converging to VMManaged with nothing
+	// blocking GC is the invariant violation this whole split exists to
+	// prevent.
+	assert.True(t, hasVolumeProtectionFinalizer(updated),
+		"ownership=VMManaged must never be published without the volume-protection finalizer")
+}
+
+// TestReconcile_UnregisterDoesNotConvergeWithNoEvidence covers the other side
+// of the convergence gate: a dependent attach whose QueryLiveDiskPath fails
+// with NotFound but which carries neither the unregister-attempted marker nor
+// a finalizer, so nothing ever started an ownership transfer for it. The
+// NotFound is a genuine, retryable condition (the manager's live query returns
+// it transiently right after a storage vMotion), not proof of a completed
+// one-way transition, and must not be converged into a VMManaged claim.
+func TestReconcile_UnregisterDoesNotConvergeWithNoEvidence(t *testing.T) {
+	const volID = "vol-no-transfer-evidence"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "", "", 5, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			return "", errors.New("ServerFaultCode: The object or item referred to could not be found")
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.False(t, res.IsZero(), "a retryable live-path failure must requeue, not converge")
+	assert.False(t, unregisterCalled,
+		"UnregisterVolumeEx must not run without a captured live path")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.NotEqual(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"must not claim VMManaged for a volume whose FCD was never unregistered")
+}
+
+// TestReconcile_UnregisterConvergesForLegacyCVIWithoutMarker is the upgrade
+// guard. A CVI written before UnregisterAttemptedAnnotation existed, caught by
+// the upgrade exactly mid-transfer — unregister completed, status flip not yet
+// landed, which is precisely the window a syncer restart opens — carries a
+// finalizer and no marker. It must still converge, on the finalizer fallback,
+// rather than spiral into phase=Failed on a disk that is already VM-owned.
+//
+// Without the fallback this is a real regression introduced by the very change
+// that fixes the stray-finalizer leak, which would be a poor trade.
+func TestReconcile_UnregisterConvergesForLegacyCVIWithoutMarker(t *testing.T) {
+	const volID = "vol-legacy-no-marker"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "/vmfs/volumes/ds/legacy.vmdk", "legacy-uuid", 5,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			return "", errors.New("ServerFaultCode: The object or item referred to could not be found")
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero(), "legacy convergence is a success outcome; it must not requeue with backoff")
+	assert.False(t, unregisterCalled, "must not re-attempt the destructive call")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	assert.True(t, hasVolumeProtectionFinalizer(updated))
+	// Converging also backfills the marker, so the object stops being legacy
+	// and every later decision about it uses the precise signal.
+	assert.Contains(t, updated.Annotations, csivolumeinfov1alpha1.UnregisterAttemptedAnnotation,
+		"convergence must backfill the marker so the CVI is no longer reliant on the fallback")
+}
+
+// TestReconcile_StrayFinalizerClearedAfterCancelledAttach covers the T07
+// scenario end to end: reconcileUnregister added the volume-protection
+// finalizer, then vm-operator emptied spec.vms (the attach was cancelled)
+// before the destructive call ran, so no marker was ever written.
+//
+// Nothing in the decision table can clean this up — finishRelease is only
+// reachable via reconcileRegister, which requires ownership==VMManaged — so
+// without the pre-table self-correction the CVI settles into the
+// initial-CSIManaged branch carrying a permanent finalizer, and the PV behind
+// it can never be deleted.
+func TestReconcile_StrayFinalizerClearedAfterCancelledAttach(t *testing.T) {
+	const volID = "vol-stray-finalizer"
+	// No VMs (detach already landed), ownership not yet written, finalizer
+	// present, no unregister marker.
+	cvi := newCVI(volID, nil, "", "", "", 5,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	r := &Reconciler{
+		client:     c,
+		apiReader:  c,
+		scheme:     s,
+		configInfo: minimalConfigInfo(),
+		// The live query succeeds, confirming the FCD is still registered —
+		// i.e. no unregister ever ran, so the finalizer really is stray.
+		volumeManager: &testVolumeManager{
+			queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+				return "/vmfs/volumes/ds/still-an-fcd.vmdk", nil
+			},
+		},
+		cviSvc: newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	_, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.False(t, hasVolumeProtectionFinalizer(updated),
+		"a finalizer from an attach cancelled before ownership transfer must be removed")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"the volume never left CSI's hands, so it must settle at CSIManaged")
+}
+
+// TestReconcile_StrayFinalizerKeptWhenFcdUnconfirmed is the safety valve on the
+// stray-clear path. Same shape as the test above — no VMs, no marker, finalizer
+// present — but the live FCD query fails, so we cannot prove the volume was
+// never unregistered.
+//
+// This is the legacy ambiguity: a pre-marker CVI stranded with a completed
+// unregister and a failed status flip, whose VM then detached, presents exactly
+// like a cancelled attach. Removing the finalizer there would unprotect a disk
+// that has already left CSI's hands, so the reconciler must decline and leave
+// the (repairable) leak in place instead.
+func TestReconcile_StrayFinalizerKeptWhenFcdUnconfirmed(t *testing.T) {
+	const volID = "vol-stray-unconfirmed"
+	cvi := newCVI(volID, nil, "", "", "", 5,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	r := &Reconciler{
+		client:     c,
+		apiReader:  c,
+		scheme:     s,
+		configInfo: minimalConfigInfo(),
+		volumeManager: &testVolumeManager{
+			queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+				return "", errors.New("ServerFaultCode: The object or item referred to could not be found")
+			},
+		},
+		cviSvc: newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	_, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.True(t, hasVolumeProtectionFinalizer(updated),
+		"must not remove a finalizer whose volume cannot be confirmed to still be an FCD")
+}
+
+// TestReconcile_StrayFinalizerKeptWhileUnregisterOnRecord is the negative half
+// of the test above, and the regression guard for the fix that had to be
+// reverted: the same "no dependent VM, ownership not VMManaged, finalizer
+// present" shape, but with the unregister marker set. Here the FCD really is
+// gone, so the finalizer must survive and the reconciler must instead converge
+// status forward to VMManaged so the register path can undo the transfer.
+//
+// Stripping the finalizer in this state is what produced the live
+// VMManaged-with-no-finalizer CVIs: GC unblocked on a volume that is not
+// CSI's to collect.
+func TestReconcile_StrayFinalizerKeptWhileUnregisterOnRecord(t *testing.T) {
+	const volID = "vol-marker-no-vms"
+	cvi := newCVI(volID, nil, "", "/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", 5,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{
+		csivolumeinfov1alpha1.UnregisterAttemptedAnnotation: "true",
+	}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: &testVolumeManager{},
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.False(t, res.IsZero(),
+		"the convergence branch must requeue itself; a status-only write is dropped by the predicate")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.True(t, hasVolumeProtectionFinalizer(updated),
+		"the finalizer must be kept while an unregister is on record")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"status must catch up to the unregister that already happened")
+}
+
+// TestReconcile_UnregisterSkipsRedundantSpecPatchWhenResultMatchesLivePath
+// verifies the companion mitigation: when UnregisterVolumeEx returns the same
+// diskPath/diskUUID that QueryLiveDiskPath already durably wrote a moment
+// earlier, reconcileUnregister must not issue a second, redundant spec patch.
+// Each spec patch advances metadata.generation and enqueues a fresh reconcile
+// for this object — fewer of them means fewer opportunities for the race
+// covered by TestReconcile_UnregisterConvergesOnRaceWhenAlreadyUnregistered
+// to occur in the first place.
+func TestReconcile_UnregisterSkipsRedundantSpecPatchWhenResultMatchesLivePath(t *testing.T) {
+	const volID = "vol-skip-redundant-patch"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, "", "", "", 3, nil)
+
+	s := newScheme(t)
+	// Only step 3's patch (the one superseding the live path with the
+	// UnregisterVolumeEx result) ever includes diskUUID in its payload — step
+	// 1's live-path patch and ensurePVOwnerRef's ownerReferences patch do not.
+	// Counting on that marker isolates the redundant patch this fix removes
+	// from the other, unrelated patches this reconcile legitimately issues.
+	diskUUIDPatchCount := 0
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch,
+			opts ...client.PatchOption) error {
+			if data, dataErr := patch.Data(obj); dataErr == nil && strings.Contains(string(data), "diskUUID") {
+				diskUUIDPatchCount++
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			return "/vmfs/volumes/ds/disk.vmdk", nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			// Identical to the live path already patched onto spec above.
+			return "/vmfs/volumes/ds/disk.vmdk", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.Equal(t, 0, diskUUIDPatchCount,
+		"the post-unregister spec patch must be skipped when its result matches the live-captured path")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "/vmfs/volumes/ds/disk.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+}
+
+// TestReconcile_UnregisterObservedGenerationTracksSpecWrite verifies that the
+// unregister path records observedGeneration from the generation returned by the
+// spec patch (which the API server bumps), not the generation observed at reconcile
+// entry.  Without this, the controller's own diskPath/diskUUID write would leave
+// observedGeneration permanently behind generation and the green signal would never
+// be satisfied.
+func TestReconcile_UnregisterObservedGenerationTracksSpecWrite(t *testing.T) {
+	const volID = "vol-gen-track"
+	const bumpedGen = int64(5)
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	// Entry generation is 4; the simulated spec write reports generation 5.
+	cvi := newCVI(volID, vms, "", "", "", 4, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: &testVolumeManager{},
+		cviSvc: &genBumpingCviService{
+			CsiVolumeInfoService: newFakeCviService(c),
+			bumpedGen:            bumpedGen,
+		},
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, bumpedGen, updated.Status.ObservedGeneration,
+		"observedGeneration must follow the post-spec-write generation")
+}
+
+// TestReconcile_BrownfieldLazy verifies that a CVI with spec.vms set but
+// ownership="" (brownfield/lazy) is treated identically to CSIManaged and
+// triggers reconcileUnregister.
+func TestReconcile_BrownfieldLazy(t *testing.T) {
+	const volID = "vol-brownfield"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	// ownership="" is the brownfield case
+	cvi := newCVI(volID, vms, "", "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	called := false
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			called = true
+			return "path", "uuid", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.True(t, called, "UnregisterVolumeEx must be called for brownfield-lazy CVI")
+}
+
+// TestReconcile_RegisterTransition verifies the full re-register path:
+// spec.vms=[], ownership=VMManaged → CreateVolume called, status.ownership=CSIManaged,
+// phase=Succeeded, protection finalizer removed.
+func TestReconcile_RegisterTransition(t *testing.T) {
+	const volID = "vol-register"
+	cvi := newCVI(volID, nil, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", 2,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+
+	pv := newTestPV("test-pv")
+	pvc := newTestPVC("test-pvc", "test-ns")
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, pv, pvc}, interceptor.Funcs{})
+
+	createCalled := false
+	mgr := &testVolumeManager{
+		createVolumeFn: func(_ context.Context, spec *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.True(t, createCalled, "CreateVolume must be called for register transition")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	assert.Equal(t, int64(2), updated.Status.ObservedGeneration)
+	assert.NotContains(t, updated.Finalizers, csivolumeinfov1alpha1.VolumeProtectionFinalizer)
+}
+
+// TestReconcile_RegisterSucceedsWhenPVCAlreadyDeleted is the namespace-teardown
+// deadlock regression test.
+//
+// The admission webhook refuses to delete a PVC whose volume is VMManaged, but
+// that check is per-object and namespace teardown does not go through it — WCP
+// deletes namespace contents directly, so the PVC vanishes while the CVI is
+// still VMManaged. reconcileRegister used to hard-error on the missing PVC, and
+// since it is the only route to finishRelease (the only place the protection
+// finalizer is removed), the CVI was stranded forever with an undeletable PV
+// behind its blockOwnerDeletion ownerRef — reachable by an ordinary
+// `kubectl delete namespace`.
+//
+// The PVC contributed only pvcMeta's name/namespace/labels; the first two are
+// recorded on the CVI spec and the labels describe a claim that no longer
+// exists, so the volume must still re-register and release.
+func TestReconcile_RegisterSucceedsWhenPVCAlreadyDeleted(t *testing.T) {
+	const volID = "vol-register-pvc-gone"
+	cvi := newCVI(volID, nil, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "disk-uuid-123", 2,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+
+	// PV present, PVC deliberately absent — exactly what namespace teardown
+	// leaves behind, since PVs are cluster-scoped and the CVI's ownerRef
+	// blocks the PV's own deletion.
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	createCalled := false
+	mgr := &testVolumeManager{
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err, "a deleted PVC must not block re-registration")
+	assert.True(t, res.IsZero(), "must not spin in backoff on a PVC that can never come back")
+	assert.True(t, createCalled,
+		"the FCD must still be re-registered so the normal CSI delete path can clean it up")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	assert.False(t, hasVolumeProtectionFinalizer(updated),
+		"the finalizer must be released, or the PV stays undeletable forever")
+}
+
+// TestReconcile_RegisterAlreadyExists verifies that a CnsVolumeAlreadyExistsFault
+// from CreateVolume is treated as success (idempotent re-register).
+func TestReconcile_RegisterAlreadyExists(t *testing.T) {
+	const volID = "vol-already-exists"
+	cvi := newCVI(volID, nil, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "disk-uuid", 1,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+
+	pv := newTestPV("test-pv")
+	pvc := newTestPVC("test-pvc", "test-ns")
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, pv, pvc}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			// Simulate CnsVolumeAlreadyExistsFault
+			return nil, "vim.fault.CnsVolumeAlreadyExistsFault",
+				errors.New("volume already exists")
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+}
+
+// TestReconcile_IdleVMsPresent_VMManaged verifies that a CVI with VMs and
+// ownership=VMManaged is idle (the VM already owns the disk, nothing to do).
+func TestReconcile_IdleVMsPresent_VMManaged(t *testing.T) {
+	const volID = "vol-idle-vm"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}, {VMName: "vm-b"}}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged, "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	callCount := 0
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			callCount++
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.Equal(t, 0, callCount, "UnregisterVolumeEx must NOT be called for idle CVI")
+}
+
+// TestReconcile_IdleNoVMs_CSIManaged verifies that a CVI with no VMs and
+// ownership=CSIManaged is idle (already in CSI-managed steady state).
+func TestReconcile_IdleNoVMs_CSIManaged(t *testing.T) {
+	const volID = "vol-idle-csi"
+	cvi := newCVI(volID, nil, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	createCalled := false
+	mgr := &testVolumeManager{
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, createCalled, "CreateVolume must NOT be called for idle CVI")
+}
+
+// TestReconcile_IndependentOnlyIsIdleForOwnership verifies that a CVI whose
+// spec.vms entries are all independent (no Persistent entry) stays
+// CSIManaged for the life of the attachment: neither UnregisterVolumeEx nor
+// CreateVolume is ever called, because ownership never transfers for an
+// independent-only volume.
+func TestReconcile_IndependentOnlyIsIdleForOwnership(t *testing.T) {
+	const volID = "vol-independent-only"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+		{VMName: "vm-b", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentNonPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled := false
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, unregisterCalled, "UnregisterVolumeEx must NOT be called for an independent-only CVI")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"an independent-only volume must stay CSIManaged")
+}
+
+// TestReconcile_IndependentOnlyResolvesDiskPathOnce verifies that an
+// independent-only CVI with no spec.diskPath yet gets one resolved via
+// QueryLiveDiskPath — the one live query this branch is allowed to make,
+// since an independent attach never runs reconcileUnregister (the only
+// other place a live path gets captured) and vm-operator has no CNS/vslm
+// client of its own to resolve it.
+func TestReconcile_IndependentOnlyResolvesDiskPathOnce(t *testing.T) {
+	const volID = "vol-independent-nopath"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			queryCalled = true
+			return "[datastore1] fcd/resolved.vmdk", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.True(t, queryCalled, "QueryLiveDiskPath must be called to resolve an unset diskPath")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "[datastore1] fcd/resolved.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"resolving diskPath must not transfer ownership")
+}
+
+// TestReconcile_IndependentOnlyWithDiskPathNeverQueriesAgain verifies that
+// once an independent-only CVI's diskPath is set, the reconciler stays a
+// true no-op — QueryLiveDiskPath is not called on every reconcile.
+func TestReconcile_IndependentOnlyWithDiskPathNeverQueriesAgain(t *testing.T) {
+	const volID = "vol-independent-haspath"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged,
+		"[datastore1] fcd/already-resolved.vmdk", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			queryCalled = true
+			return "unexpected", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, queryCalled, "QueryLiveDiskPath must not be called once diskPath is already resolved")
+}
+
+// TestReconcile_DiskPathRefreshRequested_Independent verifies that an
+// independent-only, CSIManaged CVI with the refresh-requested annotation
+// gets spec.diskPath re-resolved and the annotation cleared.
+func TestReconcile_DiskPathRefreshRequested_Independent(t *testing.T) {
+	const volID = "vol-independent-refresh"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged,
+		"[datastore1] fcd/stale.vmdk", "", 1, nil)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled := false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			queryCalled = true
+			return "[datastore1] fcd/relocated.vmdk", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.True(t, queryCalled, "QueryLiveDiskPath must be called to re-resolve the requested refresh")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "[datastore1] fcd/relocated.vmdk", updated.Spec.DiskPath)
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.False(t, stillRequested, "refresh-requested annotation must be cleared after the refresh lands")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"a plain refresh must not change ownership")
+}
+
+// TestReconcile_DiskPathRefreshRequested_Dependent verifies that a
+// dependent, VMManaged CVI (already transferred, not fcd-retained) with the
+// refresh-requested annotation gets spec.diskPath re-resolved and the
+// annotation cleared, WITHOUT ever calling UnregisterVolumeEx or CreateVolume
+// — the ownership==VMManaged invariant that diskPath is non-empty must hold
+// throughout, so this must be a plain value replacement, not a transfer.
+func TestReconcile_DiskPathRefreshRequested_Dependent(t *testing.T) {
+	const volID = "vol-dependent-refresh"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"[datastore1] fcd/stale.vmdk", "test-disk-uuid", 1, nil)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled, unregisterCalled, createCalled := false, false, false
+	mgr := &testVolumeManager{
+		queryDiskPathFromVMFn: func(_ context.Context, _, _ string) (string, error) {
+			queryCalled = true
+			return "[datastore1] fcd/relocated.vmdk", nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return nil, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.True(t, queryCalled, "QueryDiskPathFromVM must be called to re-resolve the requested refresh — "+
+		"a VMManaged volume is already unregistered from CNS, so QueryLiveDiskPath cannot be used here")
+	assert.False(t, unregisterCalled, "a plain refresh must not unregister the FCD")
+	assert.False(t, createCalled, "a plain refresh must not re-register/create a volume")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "[datastore1] fcd/relocated.vmdk", updated.Spec.DiskPath)
+	assert.NotEmpty(t, updated.Spec.DiskPath, "diskPath must never be observed empty for a VMManaged volume")
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.False(t, stillRequested, "refresh-requested annotation must be cleared after the refresh lands")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"a plain refresh must not change ownership")
+}
+
+// TestReconcile_DiskPathRefreshRequested_DependentDiskNotAttached is the
+// deadlock regression test.
+//
+// vm-operator requests a refresh from the failure path of its own
+// AttachVolumeDisks, so when the annotation is written the attach has just
+// failed and the disk is not part of the VM's hardware. vm-operator then
+// refuses to attach while the annotation is set, and CSI used to treat "no
+// such disk on the VM" as a hard error and leave the annotation in place —
+// each side waiting on the other, forever. Observed live as T48: vm-operator
+// logging "Waiting for CSI to refresh a stale diskPath" and CSI logging
+// "QueryDiskPathFromVM failed ... no virtual disk with UUID found", in
+// lockstep, until the test timed out.
+//
+// A detached VMDK cannot have been relocated (only VM-level operations move
+// one, and they all require it attached), so the recorded path is still
+// correct: keep it and clear the annotation.
+func TestReconcile_DiskPathRefreshRequested_DependentDiskNotAttached(t *testing.T) {
+	const volID = "vol-dependent-refresh-detached"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"[datastore1] fcd/recorded.vmdk", "test-disk-uuid", 1, nil)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		queryDiskPathFromVMFn: func(_ context.Context, _, _ string) (string, error) {
+			return "", fmt.Errorf("QueryDiskPathFromVM: %w", cnsvolumes.ErrDiskNotAttachedToVM)
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err, "a detached disk is not a refresh failure")
+	assert.True(t, res.IsZero(), "must not requeue with backoff — there is nothing to retry")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.False(t, stillRequested,
+		"the annotation must be cleared even when the disk is not attached, or vm-operator — which "+
+			"will not attach while it is set — deadlocks against the very attach CSI is waiting for")
+	assert.Equal(t, "[datastore1] fcd/recorded.vmdk", updated.Spec.DiskPath,
+		"nothing can have relocated a detached VMDK, so the recorded path must be kept as-is")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership)
+}
+
+// TestReconcile_DiskPathRefreshRequested_DetachedWithEmptyDiskPath guards the
+// one case where clearing the annotation would be wrong: with no recorded path
+// and no VM to read one from, clearing it would hand vm-operator an empty
+// diskPath for a VMManaged volume, breaking the invariant its attach path
+// relies on. Keep the annotation and surface the error instead.
+func TestReconcile_DiskPathRefreshRequested_DetachedWithEmptyDiskPath(t *testing.T) {
+	const volID = "vol-dependent-refresh-detached-nopath"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged, "", "test-disk-uuid", 1, nil)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		queryDiskPathFromVMFn: func(_ context.Context, _, _ string) (string, error) {
+			return "", fmt.Errorf("QueryDiskPathFromVM: %w", cnsvolumes.ErrDiskNotAttachedToVM)
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.False(t, res.IsZero(), "must requeue: there is genuinely no path to publish yet")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.True(t, stillRequested,
+		"must not clear the annotation while spec.diskPath is empty — doing so publishes an empty "+
+			"diskPath for a VMManaged volume")
+}
+
+// TestReconcile_IdleRecordsObservedGeneration is the second half of the T48
+// deadlock. vm-operator's green signal is
+// status.observedGeneration >= metadata.generation, and vm-operator itself
+// writes spec.vms (filling in diskMode/volumeName on an existing entry), which
+// bumps generation after CSI's last status write. A settled
+// dependent+VMManaged volume matches no action branch, so nothing ever
+// republished status: the CVI sat at generation=N+1 / observedGeneration=N and
+// vm-operator waited on an attach it would never start. Observed live as
+// generation=5 / observedGeneration=4 on the stuck T48 CVI.
+func TestReconcile_IdleRecordsObservedGeneration(t *testing.T) {
+	const volID = "vol-idle-observed-generation"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	// generation=5 with status written at 4: the shape vm-operator's own
+	// spec.vms write leaves behind.
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"[datastore1] fcd/disk.vmdk", "test-disk-uuid", 5,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{
+		csivolumeinfov1alpha1.UnregisterAttemptedAnnotation: "true",
+	}
+	cvi.Status.Phase = csivolumeinfov1alpha1.PhaseSucceeded
+	cvi.Status.ObservedGeneration = 4
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: &testVolumeManager{},
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	_, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	assert.EqualValues(t, 5, updated.Status.ObservedGeneration,
+		"an idle reconcile must still acknowledge the generation it observed, or vm-operator's "+
+			"green signal never returns true")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"acknowledging a generation must not change ownership")
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	assert.True(t, hasVolumeProtectionFinalizer(updated),
+		"acknowledging a generation must not disturb the protection finalizer")
+}
+
+// TestReconcile_DiskPathRefreshRequested_UnserviceableClearsAndReleases is the
+// 1 Hz-spin regression test.
+//
+// A refresh annotation on a volume with no dependent VM and ownership=VMManaged
+// can never be serviced: there is no VM device list to re-resolve the path
+// from. The gate used to defer unconditionally and return before the decision
+// table, so such a volume was reconciled once a second forever while the
+// release path (!hasDependent && VMManaged -> reconcileRegister) sat
+// unreachable just below. Ownership stayed VMManaged, the protection finalizer
+// was never dropped, and the PVC and PV behind it became permanently
+// undeletable.
+//
+// Observed in the field: two CVIs whose VMs had already been deleted, logging
+// "not yet in an eligible state; deferring" 180 times in 3 minutes, unhealed
+// across a controller restart because nothing else could ever act on them.
+func TestReconcile_DiskPathRefreshRequested_UnserviceableClearsAndReleases(t *testing.T) {
+	const volID = "vol-refresh-unserviceable"
+	// No VMs (the VM was deleted), still VMManaged, refresh annotation set —
+	// exactly the stranded shape.
+	cvi := newCVI(volID, nil, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"[datastore1] fcd/disk.vmdk", "test-disk-uuid", 2,
+		[]string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{
+		csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true",
+		csivolumeinfov1alpha1.UnregisterAttemptedAnnotation:      "true",
+	}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	createCalled := false
+	mgr := &testVolumeManager{
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero(),
+		"must not requeue: an unserviceable refresh has to stop blocking, not spin at 1 Hz")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.False(t, stillRequested, "an unserviceable refresh annotation must be cleared")
+	assert.True(t, createCalled,
+		"clearing the annotation must let the same reconcile fall through to the release path")
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"the volume must actually release, not just lose its annotation")
+	assert.False(t, hasVolumeProtectionFinalizer(updated),
+		"the finalizer must be dropped, or the PVC and PV stay undeletable")
+}
+
+// TestReconcile_DiskPathRefreshRequested_NotYetEligibleDefers verifies that
+// a refresh request against a volume mid-transfer (hasDependent, ownership
+// not yet VMManaged) is deferred rather than acted on immediately — acting
+// here would race the transfer itself.
+func TestReconcile_DiskPathRefreshRequested_NotYetEligibleDefers(t *testing.T) {
+	const volID = "vol-dependent-midtransfer"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, "", "", "", 1, nil)
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	queryCalled, unregisterCalled := false, false
+	mgr := &testVolumeManager{
+		queryLiveDiskPathFn: func(_ context.Context, _ string) (string, error) {
+			queryCalled = true
+			return "unexpected", nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.False(t, res.IsZero(), "must requeue rather than act while not yet eligible")
+	assert.False(t, queryCalled, "must not resolve diskPath while mid-transfer")
+	assert.False(t, unregisterCalled, "the refresh check must not itself drive the transfer")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	_, stillRequested := updated.Annotations[csivolumeinfov1alpha1.DiskPathRefreshRequestedAnnotation]
+	assert.True(t, stillRequested, "annotation must remain until the volume is eligible")
+}
+
+// TestReconcile_MixedDiskModesFailsLegibly verifies the reconciler-side
+// single-mode invariant guard (defense in depth for a webhook outage): a
+// spec.vms mixing a Persistent entry with an Independent* entry sets
+// phase=Failed with a named error rather than guessing which behavior
+// applies, and never calls UnregisterVolumeEx or CreateVolume.
+func TestReconcile_MixedDiskModesFailsLegibly(t *testing.T) {
+	const volID = "vol-mixed-modes"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+		{VMName: "vm-b", DiskMode: csivolumeinfov1alpha1.DiskModeIndependentPersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled, createCalled := false, false
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, unregisterCalled, "a mixed-mode CVI must not attempt an ownership transfer")
+	assert.False(t, createCalled, "a mixed-mode CVI must not attempt a release")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseFailed, updated.Status.Phase)
+	assert.NotEmpty(t, updated.Status.Error)
+}
+
+// TestReconcile_FcdRetainedStillInfeasibleSkipsAttempt verifies that when the
+// feasibility query still reports the volume infeasible, attemptConvergence
+// does not bother re-attempting the unregister (a doomed attempt and a task
+// record are worth saving), and never calls CreateVolume either — the volume
+// is still attached, not released.
+func TestReconcile_FcdRetainedStillInfeasibleSkipsAttempt(t *testing.T) {
+	const volID = "vol-fcd-retained-attached"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "", 3, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	unregisterCalled, createCalled := false, false
+	mgr := &testVolumeManager{
+		queryUnregisterFeasibilityFn: func(_ context.Context,
+			volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			return []cnsvolumes.UnregisterFeasibility{{VolumeID: volID, Feasible: false}}, nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, unregisterCalled, "a still-infeasible volume must not trigger a re-attempt")
+	assert.False(t, createCalled, "a still-attached fcd-retained volume must not be released")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, "true", updated.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation],
+		"the fcd-retained annotation must be left untouched")
+}
+
+// TestReconcile_FcdRetainedConvergesWhenFeasible verifies the success path of
+// C8's convergence: when the feasibility query no longer reports a blocker,
+// attemptConvergence re-attempts the unregister, and on success drops
+// fcd-retained and refreshes spec.diskPath without any status transition —
+// ownership was already VMManaged.
+func TestReconcile_FcdRetainedConvergesWhenFeasible(t *testing.T) {
+	const volID = "vol-fcd-retained-converges"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/stale.vmdk", "", 3, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		queryUnregisterFeasibilityFn: func(_ context.Context,
+			volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			return []cnsvolumes.UnregisterFeasibility{{VolumeID: volID, Feasible: true}}, nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, id string) (string, string, string, error) {
+			assert.Equal(t, volID, id)
+			return "/vmfs/volumes/ds/converged.vmdk", "disk-uuid-converged", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.NotContains(t, updated.Annotations, csivolumeinfov1alpha1.FcdRetainedAnnotation)
+	assert.Equal(t, "/vmfs/volumes/ds/converged.vmdk", updated.Spec.DiskPath)
+	assert.Equal(t, "disk-uuid-converged", updated.Spec.DiskUUID)
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership,
+		"no status transition — ownership was already VMManaged")
+}
+
+// TestRecordedBlockerIsLinkedCloneNeverReattempted verifies the terminal
+// short-circuit: a CVI whose Ready condition names LinkedClone is never
+// re-attempted, regardless of what the feasibility query or a forced
+// UnregisterVolumeEx call would report.
+func TestRecordedBlockerIsLinkedCloneNeverReattempted(t *testing.T) {
+	const volID = "vol-linked-clone"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{
+		{VMName: "vm-a", DiskMode: csivolumeinfov1alpha1.DiskModePersistent},
+	}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "", 3, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+	cvi.Status.Conditions = []metav1.Condition{{
+		Type:               conditionTypeReady,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonFcdRetained,
+		Message:            "LinkedClone",
+		LastTransitionTime: metav1.Now(),
+	}}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	feasibilityCalled, unregisterCalled := false, false
+	mgr := &testVolumeManager{
+		queryUnregisterFeasibilityFn: func(_ context.Context,
+			volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			feasibilityCalled = true
+			return []cnsvolumes.UnregisterFeasibility{{VolumeID: volID, Feasible: true}}, nil
+		},
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			unregisterCalled = true
+			return "", "", "", nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, feasibilityCalled, "a LinkedClone blocker must short-circuit before the feasibility query")
+	assert.False(t, unregisterCalled, "a LinkedClone blocker must never be re-attempted")
+}
+
+// TestReconcile_FcdRetainedReleaseSkipsCreateVolume verifies C7's skip
+// branch: once the last dependent entry leaves spec.vms, a retained FCD is
+// released without ever calling CreateVolume or converting the datastore
+// path to a folder URL, because the FCD was never unregistered in the first
+// place. The annotation is cleared and the volume returns to CSIManaged.
+func TestReconcile_FcdRetainedReleaseSkipsCreateVolume(t *testing.T) {
+	const volID = "vol-fcd-retained-release"
+	cvi := newCVI(volID, nil, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/vmfs/volumes/ds/disk.vmdk", "", 4, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+	cvi.Annotations = map[string]string{csivolumeinfov1alpha1.FcdRetainedAnnotation: "true"}
+
+	pv := newTestPV("test-pv")
+	pvc := newTestPVC("test-pvc", "test-ns")
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, pv, pvc}, interceptor.Funcs{})
+
+	createCalled, folderURLCalled := false, false
+	mgr := &testVolumeManager{
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			createCalled = true
+			return &cnsvolumes.CnsVolumeInfo{}, "", nil
+		},
+	}
+	mgr.getDiskFolderURLFn = func(_ context.Context, _ string) (string, error) {
+		folderURLCalled = true
+		return "", nil
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+	assert.False(t, createCalled, "CreateVolume must NOT be called on the fcd-retained skip branch")
+	assert.False(t, folderURLCalled, "the folder-URL conversion must NOT run on the fcd-retained skip branch")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	assert.NotContains(t, updated.Annotations, csivolumeinfov1alpha1.FcdRetainedAnnotation)
+	assert.NotContains(t, updated.Finalizers, csivolumeinfov1alpha1.VolumeProtectionFinalizer)
+}
+
+// TestReconcile_UnregisterFaultWithoutFeasibilityDefersAsStructural verifies
+// that a CNS fault during UnregisterVolumeEx, when the feasibility query
+// itself cannot be evaluated (here, unconfigured — returns zero results), is
+// classified Structural rather than treated as a hard failure: the volume is
+// deferred as fcd-retained with phase=Succeeded, not Failed. A blocked
+// unregister must never regress to the old two-phase design's hard failure.
+func TestReconcile_UnregisterFaultWithoutFeasibilityDefersAsStructural(t *testing.T) {
+	const volID = "vol-unregister-fault"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 5, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			return "", "", "", errors.New("CNS unregister fault")
+		},
+		// queryUnregisterFeasibilityFn left unconfigured: returns (nil, nil),
+		// i.e. zero results for the one volume requested.
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero(), "a deferred (fcd-retained) volume is functional, not awaiting requeue")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	assert.Empty(t, updated.Status.Error)
+	assert.Equal(t, "true", updated.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation])
+	require.NotEmpty(t, updated.Status.Conditions)
+	assert.Equal(t, conditionTypeReady, updated.Status.Conditions[0].Type)
+	assert.Equal(t, string(metav1.ConditionTrue), string(updated.Status.Conditions[0].Status))
+	assert.Equal(t, reasonFcdRetained, updated.Status.Conditions[0].Reason)
+}
+
+// TestReconcile_UnregisterBlockedPermanentDefersAsFcdRetained verifies the
+// Permanent disposition (e.g. LinkedClone): the volume defers to fcd-retained
+// exactly like Structural. (The distinction between the two — Structural
+// converges on an event, Permanent never does — is C8's job, not this
+// reconciler's.)
+func TestReconcile_UnregisterBlockedPermanentDefersAsFcdRetained(t *testing.T) {
+	const volID = "vol-unregister-permanent"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 5, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			return "", "", "vim.fault.InvalidState", errors.New("CNS unregister fault")
+		},
+		queryUnregisterFeasibilityFn: func(_ context.Context,
+			volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			require.Equal(t, []string{volID}, volumeIDs)
+			return []cnsvolumes.UnregisterFeasibility{{
+				VolumeID: volID,
+				Feasible: false,
+				Blockers: []cnstypes.CnsUnregisterBlocker{{
+					Condition:   cnstypes.CnsUnregisterBlockerConditionLinkedClone,
+					Disposition: cnstypes.CnsUnregisterBlockerDispositionPermanent,
+				}},
+			}}, nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateVMManaged, updated.Status.Ownership)
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseSucceeded, updated.Status.Phase)
+	assert.Equal(t, "true", updated.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation])
+	assert.Contains(t, updated.Status.Conditions[0].Message, "LinkedClone")
+}
+
+// TestReconcile_UnregisterBlockedTransientRequeuesWithoutStatusChange verifies
+// the Transient disposition (e.g. HostUnreachable): Reconcile requeues with
+// backoff but writes no status at all — the volume is untouched, because
+// nothing about it has actually failed.
+func TestReconcile_UnregisterBlockedTransientRequeuesWithoutStatusChange(t *testing.T) {
+	const volID = "vol-unregister-transient"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 5, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			return "", "", "vim.fault.HostNotConnected", errors.New("host unreachable")
+		},
+		queryUnregisterFeasibilityFn: func(_ context.Context,
+			volumeIDs []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			return []cnsvolumes.UnregisterFeasibility{{
+				VolumeID: volID,
+				Feasible: false,
+				Blockers: []cnstypes.CnsUnregisterBlocker{{
+					Condition:   cnstypes.CnsUnregisterBlockerConditionHostUnreachable,
+					Disposition: cnstypes.CnsUnregisterBlockerDispositionTransient,
+				}},
+			}}, nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.Greater(t, res.RequeueAfter, time.Duration(0), "should requeue after backoff")
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.OwnershipStateCSIManaged, updated.Status.Ownership,
+		"a transient block must leave the pre-existing ownership untouched")
+	assert.Empty(t, updated.Status.Phase, "a transient block must not write phase=Failed")
+	assert.Empty(t, updated.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation])
+}
+
+// TestReconcile_RegisterFault verifies that a CNS fault during CreateVolume
+// sets status.phase=Failed and requeueing with backoff.
+func TestReconcile_RegisterFault(t *testing.T) {
+	const volID = "vol-register-fault"
+	cvi := newCVI(volID, nil, csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		"/ds/disk.vmdk", "uuid", 2, []string{csivolumeinfov1alpha1.VolumeProtectionFinalizer})
+
+	pv := newTestPV("test-pv")
+	pvc := newTestPVC("test-pvc", "test-ns")
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, pv, pvc}, interceptor.Funcs{})
+
+	mgr := &testVolumeManager{
+		createVolumeFn: func(_ context.Context, _ *cnstypes.CnsVolumeCreateSpec,
+			_ interface{}) (*cnsvolumes.CnsVolumeInfo, string, error) {
+			return nil, "vim.fault.CnsFault", errors.New("create volume fault")
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.Greater(t, res.RequeueAfter, time.Duration(0))
+
+	updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, updated))
+	assert.Equal(t, csivolumeinfov1alpha1.PhaseFailed, updated.Status.Phase)
+	assert.Equal(t, int64(2), updated.Status.ObservedGeneration)
+}
+
+// TestReconcile_ObservedGenerationAlwaysSet verifies that observedGeneration is
+// written to status on every reconcile path (success and failure).
+func TestReconcile_ObservedGenerationAlwaysSet(t *testing.T) {
+	tests := []struct {
+		name      string
+		ownership csivolumeinfov1alpha1.OwnershipState
+		vms       []csivolumeinfov1alpha1.VirtualMachineRef
+		gen       int64
+		fail      bool
+	}{
+		{
+			name: "unregister success",
+			vms:  []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}},
+			gen:  7,
+			fail: false,
+		},
+		{
+			name: "unregister failure",
+			vms:  []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}},
+			gen:  8,
+			fail: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			volID := "vol-gen-" + tc.name
+			cvi := newCVI(volID, tc.vms, tc.ownership, "", "", tc.gen, nil)
+
+			s := newScheme(t)
+			c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{})
+
+			mgr := &testVolumeManager{
+				unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+					if tc.fail {
+						return "", "", "", errors.New("forced error")
+					}
+					return "path", "uuid", "", nil
+				},
+			}
+			r := &Reconciler{
+				client:        c,
+				apiReader:     c,
+				scheme:        s,
+				configInfo:    minimalConfigInfo(),
+				volumeManager: mgr,
+				cviSvc:        newFakeCviService(c),
+			}
+			backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+			r.Reconcile(context.Background(), makeRequest(volID)) //nolint:errcheck
+
+			updated := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+			require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+				Namespace: csivolumeinfov1alpha1.CVINamespace,
+				Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+			}, updated))
+			assert.Equal(t, updated.Generation, updated.Status.ObservedGeneration,
+				"observedGeneration must equal the live spec.generation")
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// worstDisposition unit test
+// ---------------------------------------------------------------------------
+
+// TestWorstDisposition covers every disposition tier plus the two load-bearing
+// defaults: an unrecognized disposition value must be treated as Structural
+// (deferring an unfamiliar blocker is safe; retrying one forever is not), and
+// an empty blocker list must be treated as Transient (either the blocker
+// cleared, or the fault was unrelated to feasibility).
+func TestWorstDisposition(t *testing.T) {
+	tests := []struct {
+		name     string
+		blockers []cnstypes.CnsUnregisterBlocker
+		want     disposition
+	}{
+		{
+			name:     "empty blocker list is transient",
+			blockers: nil,
+			want:     dispositionTransient,
+		},
+		{
+			name: "single transient blocker",
+			blockers: []cnstypes.CnsUnregisterBlocker{
+				{Disposition: cnstypes.CnsUnregisterBlockerDispositionTransient},
+			},
+			want: dispositionTransient,
+		},
+		{
+			name: "single structural blocker",
+			blockers: []cnstypes.CnsUnregisterBlocker{
+				{Disposition: cnstypes.CnsUnregisterBlockerDispositionStructural},
+			},
+			want: dispositionStructural,
+		},
+		{
+			name: "single permanent blocker",
+			blockers: []cnstypes.CnsUnregisterBlocker{
+				{Disposition: cnstypes.CnsUnregisterBlockerDispositionPermanent},
+			},
+			want: dispositionPermanent,
+		},
+		{
+			name: "unrecognized disposition defaults to structural",
+			blockers: []cnstypes.CnsUnregisterBlocker{
+				{Disposition: "SOME_FUTURE_DISPOSITION"},
+			},
+			want: dispositionStructural,
+		},
+		{
+			name: "mixed dispositions — the most severe wins (permanent)",
+			blockers: []cnstypes.CnsUnregisterBlocker{
+				{Disposition: cnstypes.CnsUnregisterBlockerDispositionTransient},
+				{Disposition: cnstypes.CnsUnregisterBlockerDispositionPermanent},
+				{Disposition: cnstypes.CnsUnregisterBlockerDispositionStructural},
+			},
+			want: dispositionPermanent,
+		},
+		{
+			name: "mixed dispositions — the most severe wins (structural over transient)",
+			blockers: []cnstypes.CnsUnregisterBlocker{
+				{Disposition: cnstypes.CnsUnregisterBlockerDispositionTransient},
+				{Disposition: cnstypes.CnsUnregisterBlockerDispositionStructural},
+			},
+			want: dispositionStructural,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, worstDisposition(tc.blockers))
+		})
+	}
+}
+
+// TestReconcile_FcdRetainedPatchOrderingBeforeStatus verifies the one ordering
+// a refactor is most likely to break silently: the fcd-retained annotation
+// patch must land strictly before the status flip. It asserts this by
+// intercepting the status-subresource patch and reading the CVI's live
+// annotations at that moment, rather than relying on call-count ordering.
+func TestReconcile_FcdRetainedPatchOrderingBeforeStatus(t *testing.T) {
+	const volID = "vol-fcd-retained-ordering"
+	vms := []csivolumeinfov1alpha1.VirtualMachineRef{{VMName: "vm-a"}}
+	cvi := newCVI(volID, vms, csivolumeinfov1alpha1.OwnershipStateCSIManaged, "", "", 5, nil)
+
+	s := newScheme(t)
+
+	var annotationAtStatusPatchTime string
+	c := newFakeClient(t, s, []client.Object{cvi, newTestPV("test-pv")}, interceptor.Funcs{
+		SubResourcePatch: func(ctx context.Context, cli client.Client, subResourceName string,
+			obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+			if subResourceName == "status" {
+				existing := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+				if err := cli.Get(ctx, k8stypes.NamespacedName{
+					Namespace: csivolumeinfov1alpha1.CVINamespace,
+					Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+				}, existing); err == nil {
+					annotationAtStatusPatchTime = existing.Annotations[csivolumeinfov1alpha1.FcdRetainedAnnotation]
+				}
+			}
+			return cli.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
+		},
+	})
+
+	mgr := &testVolumeManager{
+		unregisterVolumeExFn: func(_ context.Context, _ string) (string, string, string, error) {
+			return "", "", "vim.fault.InvalidState", errors.New("blocked")
+		},
+		queryUnregisterFeasibilityFn: func(_ context.Context, _ []string) ([]cnsvolumes.UnregisterFeasibility, error) {
+			return []cnsvolumes.UnregisterFeasibility{{
+				VolumeID: volID,
+				Feasible: false,
+				Blockers: []cnstypes.CnsUnregisterBlocker{{
+					Condition:   cnstypes.CnsUnregisterBlockerConditionFcdSnapshotsPresent,
+					Disposition: cnstypes.CnsUnregisterBlockerDispositionStructural,
+				}},
+			}}, nil
+		},
+	}
+
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: mgr,
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	_, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.Equal(t, "true", annotationAtStatusPatchTime,
+		"the fcd-retained annotation must already be set by the time the status patch is issued")
+}
+
+// ---------------------------------------------------------------------------
+// buildStatusPatch unit test
+// ---------------------------------------------------------------------------
+
+// TestBuildStatusPatch verifies that buildStatusPatch produces a valid JSON
+// merge-patch with all required fields.
+func TestBuildStatusPatch(t *testing.T) {
+	patch := buildStatusPatch(42,
+		csivolumeinfov1alpha1.OwnershipStateVMManaged,
+		csivolumeinfov1alpha1.PhaseSucceeded,
+		"", "", reasonUnregisterSucceeded, true)
+	require.NotNil(t, patch)
+
+	var m map[string]interface{}
+	require.NoError(t, json.Unmarshal(patch, &m))
+
+	status, ok := m["status"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, string(csivolumeinfov1alpha1.OwnershipStateVMManaged), status["ownership"])
+	assert.Equal(t, string(csivolumeinfov1alpha1.PhaseSucceeded), status["phase"])
+	assert.Equal(t, float64(42), status["observedGeneration"])
+
+	conds, ok := status["conditions"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, conds, 1)
+	cond := conds[0].(map[string]interface{})
+	assert.Equal(t, conditionTypeReady, cond["type"])
+	assert.Equal(t, string(metav1.ConditionTrue), cond["status"])
+	assert.Equal(t, reasonUnregisterSucceeded, cond["reason"])
+}
+
+// ---------------------------------------------------------------------------
+// resolveStoragePolicyID unit tests
+// ---------------------------------------------------------------------------
+
+func TestResolveStoragePolicyID_FromPVAttributes(t *testing.T) {
+	pv := newTestPV("test-pv")
+	s := newScheme(t)
+	c := newFakeClient(t, s, nil, interceptor.Funcs{})
+
+	id := resolveStoragePolicyID(context.Background(), c, pv)
+	assert.Equal(t, "test-policy", id)
+}
+
+func TestResolveStoragePolicyID_FromStorageClass(t *testing.T) {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pv"},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: "my-sc",
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					// No storagePolicyID in volumeAttributes
+					VolumeAttributes: map[string]string{},
+				},
+			},
+		},
+	}
+	sc := &storagev1.StorageClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-sc"},
+		Parameters: map[string]string{"storagePolicyID": "sc-policy-id"},
+	}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{sc}, interceptor.Funcs{})
+
+	id := resolveStoragePolicyID(context.Background(), c, pv)
+	assert.Equal(t, "sc-policy-id", id)
+}
+
+func TestResolveStoragePolicyID_NotFound(t *testing.T) {
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pv"},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: "missing-sc",
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					VolumeAttributes: map[string]string{},
+				},
+			},
+		},
+	}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, nil, interceptor.Funcs{})
+
+	id := resolveStoragePolicyID(context.Background(), c, pv)
+	assert.Empty(t, id)
+}
+
+// ---------------------------------------------------------------------------
+// ensurePVOwnerRef unit tests
+// ---------------------------------------------------------------------------
+
+// TestEnsurePVOwnerRef_SetsOwnerRef verifies that when the CVI has no PV
+// ownerReference, ensurePVOwnerRef patches it with blockOwnerDeletion=true.
+func TestEnsurePVOwnerRef_SetsOwnerRef(t *testing.T) {
+	const volID = "vol-ownerref-set"
+	cvi := newCVI(volID, nil, "", "", "", 1, nil)
+
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pv",
+			UID:  k8stypes.UID("pv-uid-abc123"),
+		},
+	}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, pv}, interceptor.Funcs{})
+	r := &Reconciler{client: c, scheme: s}
+
+	err := r.ensurePVOwnerRef(context.Background(), cvi)
+	require.NoError(t, err)
+
+	// Reload CVI and verify the ownerRef was written.
+	got := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      cvi.Name,
+	}, got))
+
+	require.Len(t, got.OwnerReferences, 1)
+	ref := got.OwnerReferences[0]
+	assert.Equal(t, "v1", ref.APIVersion)
+	assert.Equal(t, "PersistentVolume", ref.Kind)
+	assert.Equal(t, "test-pv", ref.Name)
+	assert.Equal(t, k8stypes.UID("pv-uid-abc123"), ref.UID)
+	require.NotNil(t, ref.BlockOwnerDeletion)
+	assert.True(t, *ref.BlockOwnerDeletion)
+	assert.Nil(t, ref.Controller, "controller should not be set — PV is owner for GC, not managing controller")
+}
+
+// TestEnsurePVOwnerRef_AlreadySet verifies that ensurePVOwnerRef is a no-op
+// when the ownerReference is already present and no Patch call is made.
+func TestEnsurePVOwnerRef_AlreadySet(t *testing.T) {
+	const volID = "vol-ownerref-already"
+	cvi := newCVI(volID, nil, "", "", "", 1, nil)
+	cvi.OwnerReferences = []metav1.OwnerReference{
+		{APIVersion: "v1", Kind: "PersistentVolume", Name: "test-pv", UID: "existing-uid"},
+	}
+
+	s := newScheme(t)
+	patchCalled := false
+	c := newFakeClient(t, s, []client.Object{cvi}, interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			patch client.Patch, opts ...client.PatchOption) error {
+			patchCalled = true
+			return nil
+		},
+	})
+	r := &Reconciler{client: c, scheme: s}
+
+	err := r.ensurePVOwnerRef(context.Background(), cvi)
+	require.NoError(t, err)
+	assert.False(t, patchCalled, "Patch must not be called when ownerRef is already set")
+}
+
+// TestEnsurePVOwnerRef_PVNotFound verifies that a missing PV returns an error
+// so controller-runtime requeues the reconcile.
+func TestEnsurePVOwnerRef_PVNotFound(t *testing.T) {
+	const volID = "vol-ownerref-nopv"
+	cvi := newCVI(volID, nil, "", "", "", 1, nil)
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi}, interceptor.Funcs{})
+	r := &Reconciler{client: c, scheme: s}
+
+	err := r.ensurePVOwnerRef(context.Background(), cvi)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+// TestEnsurePVOwnerRef_EmptyPVName verifies that a CVI with no spec.pvName
+// is silently skipped.
+func TestEnsurePVOwnerRef_EmptyPVName(t *testing.T) {
+	const volID = "vol-ownerref-nopvname"
+	cvi := newCVI(volID, nil, "", "", "", 1, nil)
+	cvi.Spec.PVName = ""
+
+	s := newScheme(t)
+	patchCalled := false
+	c := newFakeClient(t, s, []client.Object{cvi}, interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+			patch client.Patch, opts ...client.PatchOption) error {
+			patchCalled = true
+			return nil
+		},
+	})
+	r := &Reconciler{client: c, scheme: s}
+
+	err := r.ensurePVOwnerRef(context.Background(), cvi)
+	require.NoError(t, err)
+	assert.False(t, patchCalled, "Patch must not be called when pvName is empty")
+}
+
+// TestReconcile_SetsOwnerRefOnInitialState verifies that a full Reconcile on a
+// freshly-created CVI (no VMs, no ownership) sets the PV ownerRef and writes
+// the initial CSIManaged status.
+func TestReconcile_SetsOwnerRefOnInitialState(t *testing.T) {
+	const volID = "vol-ownerref-initial"
+	cvi := newCVI(volID, nil, "", "", "", 1, nil)
+
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pv",
+			UID:  k8stypes.UID("pv-uid-initial"),
+		},
+	}
+
+	s := newScheme(t)
+	c := newFakeClient(t, s, []client.Object{cvi, pv}, interceptor.Funcs{})
+	r := &Reconciler{
+		client:        c,
+		apiReader:     c,
+		scheme:        s,
+		configInfo:    minimalConfigInfo(),
+		volumeManager: &testVolumeManager{},
+		cviSvc:        newFakeCviService(c),
+	}
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+
+	res, err := r.Reconcile(context.Background(), makeRequest(volID))
+	require.NoError(t, err)
+	assert.True(t, res.IsZero())
+
+	got := &csivolumeinfov1alpha1.CsiVolumeInfo{}
+	require.NoError(t, c.Get(context.Background(), k8stypes.NamespacedName{
+		Namespace: csivolumeinfov1alpha1.CVINamespace,
+		Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volID),
+	}, got))
+
+	// ownerRef must be set.
+	require.Len(t, got.OwnerReferences, 1)
+	assert.Equal(t, k8stypes.UID("pv-uid-initial"), got.OwnerReferences[0].UID)
+}
+
+// ---------------------------------------------------------------------------
+// Backoff helper unit tests
+// ---------------------------------------------------------------------------
+
+func TestBackoffHelpers(t *testing.T) {
+	backOffDuration = make(map[k8stypes.NamespacedName]time.Duration)
+	ctx := context.Background()
+	nn := k8stypes.NamespacedName{Name: "test"}
+
+	// Initial backoff should be 1s.
+	d := getBackoffDuration(ctx, nn)
+	assert.Equal(t, time.Second, d)
+
+	// Double it.
+	doubleBackoffDuration(ctx, nn)
+	d = getBackoffDuration(ctx, nn)
+	assert.Equal(t, 2*time.Second, d)
+
+	// Delete it.
+	deleteBackoffEntry(ctx, nn)
+	assert.NotContains(t, backOffDuration, nn)
+}

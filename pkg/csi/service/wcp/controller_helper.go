@@ -40,7 +40,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	spv1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/storagepool/cns/v1alpha1"
 	"sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/vsphere"
 	cnsconfig "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/config"
@@ -192,6 +194,65 @@ func validateWCPControllerExpandVolumeRequest(ctx context.Context, req *csi.Cont
 		return common.IsOnlineExpansion(ctx, req.GetVolumeId(), nodes)
 	}
 	return nil
+}
+
+// newVMOperatorClientForVMLookup builds a vm-operator client, matching the
+// pattern used elsewhere in this file. Overridable in tests.
+var newVMOperatorClientForVMLookup = func(ctx context.Context) (ctrlclient.Client, error) {
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+	return k8s.NewClientForGroup(ctx, cfg, vmoperatortypes.GroupName)
+}
+
+// vmOwnedVolumesVMsGone reports whether every VM in vms is confirmed gone, so
+// that a caller can safely stop protecting a VM-managed volume it would
+// otherwise block from deletion. When vms is empty (VMManaged with no VM
+// currently on record), it falls back to checking whether the volume's
+// namespace itself is gone or being deleted via the namespace informer
+// cache — a VM cannot exist in a namespace that no longer does. Fails closed
+// (returns false, i.e. assume a VM is still there) on any lookup error, since
+// a transient failure must never wrongly unblock a volume delete.
+func (c *controller) vmOwnedVolumesVMsGone(ctx context.Context, namespace string,
+	vms []csivolumeinfov1alpha1.VirtualMachineRef) bool {
+	log := logger.GetLogger(ctx)
+
+	if len(vms) == 0 {
+		if c.namespaceLister == nil {
+			return false
+		}
+		ns, err := c.namespaceLister.Get(namespace)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return true
+			}
+			log.Warnf("vmOwnedVolumesVMsGone: failed to get namespace %q: %v; assuming a VM still exists",
+				namespace, err)
+			return false
+		}
+		return ns.DeletionTimestamp != nil
+	}
+
+	vmOperatorClient, err := newVMOperatorClientForVMLookup(ctx)
+	if err != nil {
+		log.Warnf("vmOwnedVolumesVMsGone: failed to get vm-operator client: %v; assuming a VM still exists", err)
+		return false
+	}
+
+	for _, vmRef := range vms {
+		vm := &vmoperatortypes.VirtualMachine{}
+		err := vmOperatorClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: vmRef.VMName}, vm)
+		if err == nil {
+			return false
+		}
+		if !apierrors.IsNotFound(err) {
+			log.Warnf("vmOwnedVolumesVMsGone: failed to get VM %s/%s: %v; assuming it still exists",
+				namespace, vmRef.VMName, err)
+			return false
+		}
+	}
+	return true
 }
 
 // validateWCPCreateSnapshotRequest is the helper function to

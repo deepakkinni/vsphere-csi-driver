@@ -51,6 +51,8 @@ import (
 	clientConfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 	apis "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator"
 	cnsregistervolumev1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/cnsregistervolume/v1alpha1"
+	csivolumeinfosvc "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	storagepolicyusagev1alpha3 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/storagepolicy/v1alpha3"
 	volumes "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/volume"
 	cnsvsphere "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/vsphere"
@@ -152,6 +154,20 @@ func Add(mgr manager.Manager, clusterFlavor cnstypes.CnsClusterFlavor,
 		return err
 	}
 
+	// Initialise the CsiVolumeInfo service when the VM-owned volumes feature is
+	// enabled. The service is needed to create CVIs in VMManaged state during
+	// deferred-FCD import. The CsiVolumeInfo type is registered on the manager
+	// scheme so the controller-runtime cache can track those objects.
+	var csiVolumeInfoService csivolumeinfosvc.CsiVolumeInfoService
+	if commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.VMOwnedVolumes) {
+		if schemeErr := csivolumeinfov1alpha1.AddToScheme(mgr.GetScheme()); schemeErr != nil {
+			log.Errorf("Failed to add CsiVolumeInfo to scheme. Err: %v", schemeErr)
+			return schemeErr
+		}
+		csiVolumeInfoService = csivolumeinfosvc.NewCsiVolumeInfoService(mgr.GetClient())
+		log.Infof("CsiVolumeInfo service initialised for deferred-FCD import support")
+	}
+
 	// eventBroadcaster broadcasts events on cnsregistervolume instances to the
 	// event sink.
 	eventBroadcaster := record.NewBroadcaster()
@@ -161,7 +177,7 @@ func Add(mgr manager.Manager, clusterFlavor cnstypes.CnsClusterFlavor,
 		},
 	)
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: apis.GroupName})
-	reconciler, err := newReconciler(mgr, configInfo, volumeManager, recorder, volumeInfoService)
+	reconciler, err := newReconciler(mgr, configInfo, volumeManager, recorder, volumeInfoService, csiVolumeInfoService)
 	if err != nil {
 		log.Errorf("Failed to create reconciler. Err: %v", err)
 		return err
@@ -172,7 +188,8 @@ func Add(mgr manager.Manager, clusterFlavor cnstypes.CnsClusterFlavor,
 // newReconciler returns a new reconcile.Reconciler.
 func newReconciler(mgr manager.Manager, configInfo *commonconfig.ConfigurationInfo,
 	volumeManager volumes.Manager, recorder record.EventRecorder,
-	volumeInfoService cnsvolumeinfo.VolumeInfoService) (reconcile.Reconciler, error) {
+	volumeInfoService cnsvolumeinfo.VolumeInfoService,
+	csiVolumeInfoService csivolumeinfosvc.CsiVolumeInfoService) (reconcile.Reconciler, error) {
 	ctx, log := logger.GetNewContextWithLogger()
 	k8sclient, err := k8s.NewClient(ctx)
 	if err != nil {
@@ -181,7 +198,8 @@ func newReconciler(mgr manager.Manager, configInfo *commonconfig.ConfigurationIn
 	}
 	return &ReconcileCnsRegisterVolume{client: mgr.GetClient(), scheme: mgr.GetScheme(),
 		configInfo: configInfo, volumeManager: volumeManager, recorder: recorder,
-		volumeInfoService: volumeInfoService, k8sclient: k8sclient}, nil
+		volumeInfoService: volumeInfoService, k8sclient: k8sclient,
+		csiVolumeInfoService: csiVolumeInfoService}, nil
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler.
@@ -213,13 +231,14 @@ var _ reconcile.Reconciler = &ReconcileCnsRegisterVolume{}
 type ReconcileCnsRegisterVolume struct {
 	// This client, initialized using mgr.Client() above, is a split client
 	// that reads objects from the cache and writes to the apiserver.
-	client            client.Client
-	scheme            *runtime.Scheme
-	configInfo        *commonconfig.ConfigurationInfo
-	volumeManager     volumes.Manager
-	recorder          record.EventRecorder
-	volumeInfoService cnsvolumeinfo.VolumeInfoService
-	k8sclient         clientset.Interface
+	client               client.Client
+	scheme               *runtime.Scheme
+	configInfo           *commonconfig.ConfigurationInfo
+	volumeManager        volumes.Manager
+	recorder             record.EventRecorder
+	volumeInfoService    cnsvolumeinfo.VolumeInfoService
+	k8sclient            clientset.Interface
+	csiVolumeInfoService csivolumeinfosvc.CsiVolumeInfoService
 }
 
 // Reconcile reads that state of the cluster for a CnsRegisterVolume object
@@ -292,6 +311,26 @@ func (r *ReconcileCnsRegisterVolume) Reconcile(ctx context.Context,
 		setInstanceError(ctx, r, instance, err.Error())
 		return reconcile.Result{RequeueAfter: timeout}, nil
 	}
+
+	// Refuse to register an existing FCD that a CsiVolumeInfo reports as
+	// VM-managed. Surfaced as an instance error, not a silent skip, because a
+	// clean-migrated dependent disk (a plain VMDK with a real bound PVC) is by
+	// hardware shape indistinguishable from a genuinely unmanaged classic
+	// disk, and migration creates that ambiguous shape in bulk.
+	if instance.Spec.VolumeID != "" && r.csiVolumeInfoService != nil {
+		cvi, cviErr := r.csiVolumeInfoService.GetCsiVolumeInfo(ctx, instance.Spec.VolumeID)
+		if cviErr != nil {
+			log.Warnf("Failed to get CsiVolumeInfo for volume %q: %v; proceeding with registration",
+				instance.Spec.VolumeID, cviErr)
+		} else if cvi != nil && cvi.Status.Ownership == csivolumeinfov1alpha1.OwnershipStateVMManaged {
+			msg := fmt.Sprintf("volume %q is VM-managed; register requests are not permitted for VM-owned volumes",
+				instance.Spec.VolumeID)
+			log.Error(msg)
+			setInstanceError(ctx, r, instance, msg)
+			return reconcile.Result{RequeueAfter: timeout}, nil
+		}
+	}
+
 	// Verify if CnsRegisterVolume request is for block volume registration
 	// Currently file volume registration is not supported.
 	ok := isBlockVolumeRegisterRequest(ctx, instance)
@@ -302,6 +341,12 @@ func (r *ReconcileCnsRegisterVolume) Reconcile(ctx context.Context,
 		log.Error(msg)
 		setInstanceError(ctx, r, instance, msg)
 		return reconcile.Result{RequeueAfter: timeout}, nil
+	}
+
+	// Deferred-FCD import: create PV and CsiVolumeInfo keyed on the PVC UID
+	// without registering an FCD. This bypasses all FCD and CNS DB operations.
+	if instance.Spec.DeferFcdRegistration {
+		return r.reconcileDeferFcdRegistration(ctx, instance, request, timeout)
 	}
 
 	vc, err := cnsvsphere.GetVirtualCenterInstance(ctx, r.configInfo, false)
@@ -552,7 +597,8 @@ func (r *ReconcileCnsRegisterVolume) Reconcile(ctx context.Context,
 	// Check if PVC already exists and has valid DataSourceRef
 	// Do this check before creating a PV. Otherwise, PVC will be bound to PV after PV
 	// is created even if validation fails
-	pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, instance.Spec.PvcName, instance.Namespace)
+	pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, r.csiVolumeInfoService,
+		instance.Spec.PvcName, instance.Namespace)
 	if err != nil {
 		log.Errorf("Failed to check existing PVC %s/%s with DataSourceRef: %+v", instance.Namespace,
 			instance.Spec.PvcName, err)
@@ -1045,8 +1091,17 @@ func isTopologyCompatible(pvcTopologySegments, volumeTopologySegments []map[stri
 // Returns the PVC if it exists with no DataSourceRef or it exists with a supported DataSourceRef.
 // If PVC exists but has an unsupported DataSourceRef, return (nil, error).
 // If PVC does not exist, return (nil, nil) so that it will be created later.
+//
+// cviSvc may be nil (VMOwnedVolumes disabled, or a caller that doesn't need
+// this check); when non-nil, a PVC already bound to a volume tracked by a
+// CsiVolumeInfo is treated as already-managed and refused outright, rather
+// than being folded into the DataSourceRef reuse logic below — a
+// clean-migrated dependent disk is a plain VMDK with a real bound PVC,
+// indistinguishable by hardware shape from a genuinely unmanaged classic
+// disk, and this placeholder-PVC path must not mutate the immutable spec of
+// a PVC that CSI or a user provisioned.
 func checkExistingPVCDataSourceRef(ctx context.Context, k8sclient clientset.Interface,
-	pvcName, namespace string) (*v1.PersistentVolumeClaim, error) {
+	cviSvc csivolumeinfosvc.CsiVolumeInfoService, pvcName, namespace string) (*v1.PersistentVolumeClaim, error) {
 	log := logger.GetLogger(ctx)
 
 	// Try to get the existing PVC
@@ -1058,6 +1113,24 @@ func checkExistingPVCDataSourceRef(ctx context.Context, k8sclient clientset.Inte
 		}
 		// Some other error occurred
 		return nil, fmt.Errorf("failed to check existing PVC %s in namespace %s: %+v", pvcName, namespace, err)
+	}
+
+	if cviSvc != nil && existingPVC.Spec.VolumeName != "" {
+		pv, pvErr := k8sclient.CoreV1().PersistentVolumes().Get(ctx, existingPVC.Spec.VolumeName, metav1.GetOptions{})
+		if pvErr != nil && !apierrors.IsNotFound(pvErr) {
+			log.Warnf("checkExistingPVCDataSourceRef: failed to get PV %q for PVC %s/%s: %v; "+
+				"proceeding without the CVI check", existingPVC.Spec.VolumeName, namespace, pvcName, pvErr)
+		} else if pvErr == nil && pv.Spec.CSI != nil && pv.Spec.CSI.VolumeHandle != "" {
+			cvi, cviErr := cviSvc.GetCsiVolumeInfo(ctx, pv.Spec.CSI.VolumeHandle)
+			if cviErr != nil {
+				log.Warnf("checkExistingPVCDataSourceRef: failed to get CsiVolumeInfo for volume %q: %v; "+
+					"proceeding without the CVI check", pv.Spec.CSI.VolumeHandle, cviErr)
+			} else if cvi != nil {
+				return nil, fmt.Errorf("existing PVC %s in namespace %s is already tracked by CsiVolumeInfo "+
+					"for volume %q; CnsRegisterVolume cannot reuse a CVI-tracked PVC",
+					pvcName, namespace, pv.Spec.CSI.VolumeHandle)
+			}
+		}
 	}
 
 	// PVC exists, check if it has DataSourceRef
@@ -1397,6 +1470,13 @@ func patchCnsRegisterVolumeStatus(ctx context.Context, cnsOperatorClient client.
 	// 2. we're clearing an error (oldObj has error, newObj doesn't)
 	if newObj.Status.Error != "" || (oldObj.Status.Error != "" && newObj.Status.Error == "") {
 		statusMap["error"] = newObj.Status.Error
+	}
+
+	if newObj.Status.VolumeID != "" {
+		statusMap["volumeID"] = newObj.Status.VolumeID
+	}
+	if newObj.Status.PvName != "" {
+		statusMap["pvName"] = newObj.Status.PvName
 	}
 
 	statusPatch := map[string]interface{}{

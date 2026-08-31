@@ -49,6 +49,7 @@ import (
 	cbtconfigv1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cbtconfig/v1alpha1"
 	cnsopapis "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator"
 	cnsopv1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/cnsnodevmattachment/v1alpha1"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	volumes "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/volume"
 	cnsvsphere "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/vsphere"
 	"sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/config"
@@ -312,6 +313,43 @@ func TestCnsNodeVMBatchAttachmentWhenVmOnVcenterReturnsNotFoundErrorAndInstanceI
 			expectedErrorMsg := expectedReconcileError.Error()
 			assert.Equal(t, expectedErrorMsg, updatedCnsNodeVMBatchAttachment.Status.Conditions[0].Message)
 		})
+}
+
+// TestReconcileFreezesOnMigrationInProgress verifies migration §12/§13.1 change 1:
+// when vm-operator has annotated the BA with vm-owned-migration: InProgress, the
+// reconcile returns early with no attach and no detach, and never even reaches
+// the vCenter VM lookup.
+func TestReconcileFreezesOnMigrationInProgress(t *testing.T) {
+	t.Run("TestReconcileFreezesOnMigrationInProgress", func(t *testing.T) {
+		testCnsNodeVMBatchAttachment := setupTestCnsNodeVMBatchAttachment()
+		testCnsNodeVMBatchAttachment.Annotations = map[string]string{
+			cnsoperatortypes.VmOwnedMigrationAnnotation: cnsoperatortypes.VmOwnedMigrationInProgress,
+		}
+		r := setTestEnvironment(&testCnsNodeVMBatchAttachment, false)
+		commonco.ContainerOrchestratorUtility = &unittestcommon.FakeK8SOrchestrator{}
+
+		req := reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      testCnsNodeVMBatchAttachmentName,
+				Namespace: testNamespace,
+			},
+		}
+
+		GetVMFromVcenter = func(ctx context.Context, nodeUUID string,
+			configInfo config.ConfigurationInfo) (*cnsvsphere.VirtualMachine, error) {
+			t.Fatal("GetVMFromVcenter should not be called while the BA is frozen for migration")
+			return nil, nil
+		}
+
+		res, err := r.Reconcile(context.TODO(), req)
+		assert.NoError(t, err)
+		assert.Equal(t, reconcile.Result{}, res)
+
+		updatedCnsNodeVMBatchAttachment := &v1alpha1.CnsNodeVMBatchAttachment{}
+		require.NoError(t, r.client.Get(context.TODO(), req.NamespacedName, updatedCnsNodeVMBatchAttachment))
+		assert.False(t, controllerutil.ContainsFinalizer(updatedCnsNodeVMBatchAttachment, cnsoperatortypes.CNSFinalizer),
+			"frozen instance should not have the CNS finalizer added")
+	})
 }
 
 func TestReconcileWithDeletionTimestamp(t *testing.T) {
@@ -835,6 +873,7 @@ func schemeForCnsBatchAttachTests() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = v1.AddToScheme(s)
 	_ = cnsopapis.AddToScheme(s)
+	_ = csivolumeinfov1alpha1.AddToScheme(s)
 	return s
 }
 
@@ -852,10 +891,11 @@ func TestRemovePvcProtectionFinalizersForTrackedPVCs_AllSucceed(t *testing.T) {
 	defer func() { removePvcFinalizerFn = origRemovePvcFinalizerFn }()
 	removePvcFinalizerFn = func(ctx context.Context, patchClient crclient.Client,
 		k8sClient kubernetes.Interface, cnsOpClient crclient.Client,
-		pvcName, namespace, vmInstanceUUID string) error {
+		pvcName, namespace, vmInstanceUUID string, removeUsedByAnnotation bool) error {
 		assert.Equal(t, testNamespace, namespace)
 		assert.Equal(t, base.Spec.InstanceUUID, vmInstanceUUID)
 		assert.Contains(t, []string{"pvc-1", "pvc-2"}, pvcName)
+		assert.False(t, removeUsedByAnnotation)
 		return nil
 	}
 
@@ -886,7 +926,7 @@ func TestRemovePvcProtectionFinalizersForTrackedPVCs_RemoveFinalizerErrorUpdates
 	defer func() { removePvcFinalizerFn = origRemovePvcFinalizerFn }()
 	removePvcFinalizerFn = func(ctx context.Context, patchClient crclient.Client,
 		k8sClient kubernetes.Interface, cnsOpClient crclient.Client,
-		pvcName, namespace, vmInstanceUUID string) error {
+		pvcName, namespace, vmInstanceUUID string, removeUsedByAnnotation bool) error {
 		return wantErr
 	}
 
@@ -1040,6 +1080,30 @@ func TestRemovePvcFinalizer_WhenPVCIsPresent(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
+
+// TestGetVolumesToAttachAndDetach_MigrationComplete_NoAttachNoDetach verifies
+// migration §12/§13.1 change 2: once vm-operator marks the BA Complete, no
+// attach and no detach set is built, regardless of what is left in spec/status.
+// There is no independent-only mode: every disk is expected to be on the CVI
+// path by the time this annotation lands.
+func TestGetVolumesToAttachAndDetach_MigrationComplete_NoAttachNoDetach(t *testing.T) {
+	ctx := context.Background()
+	instance := setupTestCnsNodeVMBatchAttachment()
+	instance.Annotations = map[string]string{
+		cnsoperatortypes.VmOwnedMigrationAnnotation: cnsoperatortypes.VmOwnedMigrationComplete,
+	}
+
+	// vm is intentionally left as a zero-value VirtualMachine: if the Complete
+	// check did not short-circuit before the vCenter FCD query, this would panic
+	// or error out inside listAttachedFcdsForVM.
+	vm := &cnsvsphere.VirtualMachine{}
+
+	pvcsToAttach, pvcsToDetach, err := getVolumesToAttachAndDetach(ctx, &instance, vm, nil, nil, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]string{}, pvcsToAttach)
+	assert.Equal(t, map[string]string{}, pvcsToDetach)
+}
+
 func TestGetVolumesToDetachFromInstanceWhenAVolumeIsRemoved(t *testing.T) {
 	ctx := context.Background()
 	instance := setupTestCnsNodeVMBatchAttachment()
@@ -1057,9 +1121,46 @@ func TestGetVolumesToDetachFromInstanceWhenAVolumeIsRemoved(t *testing.T) {
 			SharingMode: "None", DiskMode: "persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"with-used-by-annotation": "with-used-by-annotation-1"}, pvcsToDetach)
+}
+
+// TestGetVolumesToDetachFromInstanceSkipsHandedOffVolume verifies migration
+// §13.1 change 3: an attached FCD that is absent from spec but already handed
+// off to this VM via a CsiVolumeInfo (keyed on the handoff, not on ownership)
+// must not be added to the detach list.
+func TestGetVolumesToDetachFromInstanceSkipsHandedOffVolume(t *testing.T) {
+	ctx := context.Background()
+	instance := setupTestCnsNodeVMBatchAttachment()
+
+	commonco.ContainerOrchestratorUtility = &unittestcommon.FakeK8SOrchestrator{}
+
+	const handedOffVolumeID = "with-used-by-annotation-1"
+	attachedFCDs := map[string]FCDBackingDetails{
+		handedOffVolumeID: {ControllerKey: 1000, UnitNumber: 1,
+			SharingMode: "None", DiskMode: "persistent"},
+	}
+	volumeIdsInSpec := map[string]FCDBackingDetails{}
+
+	cvi := &csivolumeinfov1alpha1.CsiVolumeInfo{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      csivolumeinfov1alpha1.CVINamePrefix + handedOffVolumeID,
+			Namespace: csivolumeinfov1alpha1.CVINamespace,
+		},
+		Spec: csivolumeinfov1alpha1.CsiVolumeInfoSpec{
+			VolumeID: handedOffVolumeID,
+			VMs: []csivolumeinfov1alpha1.VirtualMachineRef{
+				{VMName: "test-vm", VMInstanceUUID: instance.Spec.InstanceUUID},
+			},
+		},
+	}
+	cnsOperatorClient := fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).WithObjects(cvi).Build()
+
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, cnsOperatorClient, attachedFCDs, volumeIdsInSpec)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]string{}, pvcsToDetach)
 }
 
 func TestGetVolumesToDetachFromInstanceWhenNothingHasChanged(t *testing.T) {
@@ -1077,7 +1178,8 @@ func TestGetVolumesToDetachFromInstanceWhenNothingHasChanged(t *testing.T) {
 			UnitNumber: 2, SharingMode: "None", DiskMode: "persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{}, pvcsToDetach)
 }
@@ -1097,7 +1199,8 @@ func TestGetVolumesToDetachFromInstanceWhenControllerKeyIsChanged(t *testing.T) 
 			UnitNumber: 2, SharingMode: "None", DiskMode: "persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"with-used-by-annotation": "with-used-by-annotation-2"}, pvcsToDetach)
 }
@@ -1117,7 +1220,8 @@ func TestGetVolumesToDetachFromInstanceWhenUnitNumberIsChanged(t *testing.T) {
 			UnitNumber: 4, SharingMode: "None", DiskMode: "persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"with-used-by-annotation": "with-used-by-annotation-2"}, pvcsToDetach)
 }
@@ -1138,7 +1242,8 @@ func TestGetVolumesToDetachFromInstanceWhenSharingIsChanged(t *testing.T) {
 			DiskMode: "persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"with-used-by-annotation": "with-used-by-annotation-2"}, pvcsToDetach)
 }
@@ -1159,7 +1264,8 @@ func TestGetVolumesToDetachFromInstanceWhenDiskModeIsChanged(t *testing.T) {
 			DiskMode: "independent_persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"with-used-by-annotation": "with-used-by-annotation-2"}, pvcsToDetach)
 }
@@ -1180,7 +1286,8 @@ func TestGetVolumesToDetachFromInstanceWhenUsedByAndPvcFinalizerIsMissing(t *tes
 			DiskMode: "independent_persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"no-finalizer-no-usedby-1": "no-finalizer-no-usedby-1"}, pvcsToDetach)
 }
@@ -1201,7 +1308,8 @@ func TestGetVolumesToDetachFromInstanceWhenOnlyPvcFinalizerIsMissing(t *testing.
 			DiskMode: "independent_persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{"no-finalizer-1": "no-finalizer"}, pvcsToDetach)
 }
@@ -1222,7 +1330,8 @@ func TestGetVolumesToDetachFromInstanceWhenOnlyUsedByIsMissingFinalizerIsPresent
 			DiskMode: "independent_persistent"},
 	}
 
-	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance, attachedFCDs, volumeIdsInSpec)
+	pvcsToDetach, err := getVolumesToDetachFromInstance(ctx, &instance,
+		fake.NewClientBuilder().WithScheme(schemeForCnsBatchAttachTests()).Build(), attachedFCDs, volumeIdsInSpec)
 	assert.NoError(t, err)
 	assert.Equal(t, map[string]string{}, pvcsToDetach)
 }

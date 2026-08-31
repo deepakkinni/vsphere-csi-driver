@@ -155,6 +155,28 @@ func (m *mockVolumeManager) ReRegisterVolume(ctx context.Context, volumeID strin
 	return nil
 }
 
+func (m *mockVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, string, error) {
+	return "", "", "", nil
+}
+
+func (m *mockVolumeManager) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManager) QueryDiskPathFromVM(ctx context.Context,
+	vmInstanceUUID, diskUUID string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManager) QueryUnregisterFeasibility(ctx context.Context,
+	volumeIDs []string) ([]cnsvolume.UnregisterFeasibility, error) {
+	return nil, nil
+}
+
 func TestQueryVolumeSnapshotsByVolumeIDWithQuerySnapshotsCnsVolumeNotFoundFault(t *testing.T) {
 	// Skip test on ARM64 due to gomonkey limitations
 	if runtime.GOARCH == "arm64" {

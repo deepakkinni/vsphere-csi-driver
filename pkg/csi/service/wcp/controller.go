@@ -51,6 +51,8 @@ import (
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 	cbtconfigv1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cbtconfig/v1alpha1"
+	csivolumeinfosvc "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	fvsapis "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/filevolume"
 	"sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/crypto"
 	cnsvolume "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/volume"
@@ -118,6 +120,13 @@ var (
 	// vsan-file-service-policy-latebinding storage classes; legacy non-FVS paths do not use this
 	// value. Empty when the per-namespace capability is on (in which case the value is unused).
 	cachedGlobalNetworkProvider string
+	// isVMOwnedVolumesFSSEnabled is true when the VMOwnedVolumes WCP capability is enabled.
+	// When true, a CsiVolumeInfo CR is created at provisioning time and the VM-owned
+	// attach/detach path is used for greenfield VMs.
+	isVMOwnedVolumesFSSEnabled bool
+	// csiVolumeInfoService is the service used to create and manage CsiVolumeInfo CRs.
+	// Initialised once in Init when isVMOwnedVolumesFSSEnabled is true.
+	csiVolumeInfoService csivolumeinfosvc.CsiVolumeInfoService
 )
 
 var getCandidateDatastores = cnsvsphere.GetCandidateDatastoresInCluster
@@ -428,6 +437,15 @@ func (c *controller) Init(config *cnsconfig.Config, version string) error {
 			return logger.LogNewErrorf(log, "error initializing volumeInfoService. Error: %+v", err)
 		}
 		log.Infof("Successfully initialized VolumeInfoService")
+	}
+	isVMOwnedVolumesFSSEnabled = commonco.ContainerOrchestratorUtility.IsFSSEnabled(ctx, common.VMOwnedVolumes)
+	if isVMOwnedVolumesFSSEnabled {
+		log.Info("VMOwnedVolumes capability enabled; initializing CsiVolumeInfo service")
+		csiVolumeInfoService, err = csivolumeinfosvc.InitCsiVolumeInfoService(ctx)
+		if err != nil {
+			return logger.LogNewErrorf(log, "failed to initialize CsiVolumeInfo service. Error: %+v", err)
+		}
+		log.Infof("Successfully initialized CsiVolumeInfo service")
 	}
 
 	cfgDirPath := filepath.Dir(cfgPath)
@@ -1262,6 +1280,48 @@ func (c *controller) createBlockVolume(ctx context.Context, req *csi.CreateVolum
 		}
 	}
 
+	if isVMOwnedVolumesFSSEnabled {
+		pvName := req.Name
+		cviPVCName := pvcName
+		cviPVCNamespace := pvcNamespace
+		if cviPVCName == "" {
+			if v, ok := req.Parameters[common.AttributePvcName]; ok {
+				cviPVCName = v
+			}
+		}
+		if cviPVCNamespace == "" {
+			if v, ok := req.Parameters[common.AttributePvcNamespace]; ok {
+				cviPVCNamespace = v
+			}
+		}
+		if cviPVCName == "" || cviPVCNamespace == "" || pvName == "" {
+			log.Warnf("skipping CsiVolumeInfo creation for volumeID %q: missing pvcName=%q "+
+				"pvcNamespace=%q pvName=%q", volumeInfo.VolumeID.Id, cviPVCName, cviPVCNamespace, pvName)
+		} else {
+			cvi := &csivolumeinfov1alpha1.CsiVolumeInfo{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      csivolumeinfosvc.GetCsiVolumeInfoCRName(volumeInfo.VolumeID.Id),
+					Namespace: csivolumeinfov1alpha1.CVINamespace,
+				},
+				Spec: csivolumeinfov1alpha1.CsiVolumeInfoSpec{
+					VolumeID:     volumeInfo.VolumeID.Id,
+					PVCName:      cviPVCName,
+					PVCNamespace: cviPVCNamespace,
+					PVName:       pvName,
+				},
+			}
+			if createErr := csiVolumeInfoService.CreateCsiVolumeInfo(ctx, cvi); createErr != nil {
+				// Log but do not fail provisioning; the CsiVolumeInfo reconciler will
+				// repair missing CRs on the next full-sync cycle.
+				log.Warnf("failed to create CsiVolumeInfo for volumeID %q: %v; "+
+					"the syncer will repair on the next full-sync", volumeInfo.VolumeID.Id, createErr)
+			} else {
+				log.Infof("created CsiVolumeInfo CR %q for volumeID %q pvName %q",
+					cvi.Name, volumeInfo.VolumeID.Id, pvName)
+			}
+		}
+	}
+
 	if isCSIBackupAPIEnabled {
 		// It's the best effort scenario to enable the CBT before create volume.
 		// If any error occurs during CBT enablement, it may be deferred to attachment or
@@ -1968,6 +2028,16 @@ func (c *controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 			log.Error(msg)
 			return nil, csifault.CSIInvalidArgumentFault, err
 		}
+		// Refuse deletion of a VM-managed volume. Consulting the CVI rather than
+		// relying on CNS to report the volume as absent is what covers an
+		// fcd-retained volume, whose FCD and CNS DB row still exist.
+		if isVMOwnedVolumesFSSEnabled && csiVolumeInfoService != nil {
+			if blockErr := assertNotVMManaged(ctx, csiVolumeInfoService, req.VolumeId, "volume deletion",
+				c.vmOwnedVolumesVMsGone); blockErr != nil {
+				return nil, csifault.CSIInternalFault, logger.LogNewErrorCodef(log, codes.FailedPrecondition,
+					"volume deletion rejected for volume %q: %v", req.VolumeId, blockErr)
+			}
+		}
 		if cnsVolumeType == common.UnknownVolumeType {
 			cnsVolumeType = common.GetCnsVolumeType(ctx, req.VolumeId)
 			volumeType = convertCnsVolumeType(ctx, cnsVolumeType)
@@ -2004,6 +2074,19 @@ func (c *controller) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequ
 			log.Debugf("DeleteVolumeUtil returns fault %s:", faultType)
 			return nil, faultType, logger.LogNewErrorCodef(log, codes.Internal,
 				"failed to delete volume: %q. Error: %+v", req.VolumeId, err)
+		}
+
+		// After the FCD is deleted, remove the CsiVolumeInfo CR so it does not
+		// become an orphan. GC via PV ownerReference handles the normal path;
+		// this explicit delete covers the permanent-removal case where the PV
+		// is gone before GC runs. NotFound is treated as success (idempotent).
+		if isVMOwnedVolumesFSSEnabled && csiVolumeInfoService != nil {
+			if delErr := csiVolumeInfoService.DeleteCsiVolumeInfo(ctx, req.VolumeId); delErr != nil {
+				log.Warnf("DeleteVolume: failed to delete CsiVolumeInfo for volume %q: %v; "+
+					"GC cascade will clean it up on PV deletion", req.VolumeId, delErr)
+			} else {
+				log.Infof("DeleteVolume: deleted CsiVolumeInfo for volume %q", req.VolumeId)
+			}
 		}
 		return &csi.DeleteVolumeResponse{}, "", nil
 	}
@@ -2692,6 +2775,18 @@ func (c *controller) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshot
 		}
 		volumeID := req.GetSourceVolumeId()
 		volumeType = prometheus.PrometheusBlockVolumeType
+
+		// Reject snapshot creation when the volume is owned by a VM. Snapshots
+		// of VM-managed disks are not supported through CSI; vm-operator owns
+		// that path.
+		if isVMOwnedVolumesFSSEnabled && csiVolumeInfoService != nil {
+			if blockErr := assertNotVMManaged(ctx, csiVolumeInfoService, volumeID, "snapshot creation",
+				nil); blockErr != nil {
+				return nil, logger.LogNewErrorCodef(log, codes.FailedPrecondition,
+					"snapshot creation rejected for volume %q: %v", volumeID, blockErr)
+			}
+		}
+
 		// Query capacity in MB for block volume snapshot
 		volumeIds := []cnstypes.CnsVolumeId{{Id: volumeID}}
 		cnsVolumeDetailsMap, err := utils.QueryVolumeDetailsUtil(ctx, c.manager.VolumeManager, volumeIds)
@@ -3261,6 +3356,48 @@ func (c *controller) ControllerModifyVolume(ctx context.Context, req *csi.Contro
 			}
 		}
 	}
+}
+
+// vmGoneChecker reports whether the VM(s) that acquired ownership of a
+// VMManaged volume are confirmed gone. namespace and vms come from the
+// CsiVolumeInfo's spec.pvcNamespace / spec.vms.
+type vmGoneChecker func(ctx context.Context, namespace string, vms []csivolumeinfov1alpha1.VirtualMachineRef) bool
+
+// assertNotVMManaged refuses an operation on a volume whose CsiVolumeInfo
+// reports VM ownership. The check consults the CR rather than CNS state
+// because an fcd-retained volume still has a live FCD and CNS DB row, so CNS
+// will answer normally instead of reporting the volume as absent — lock-down
+// for such a volume must be active, not inherited from a NotFound that never
+// comes. Returns nil when the CVI is absent or in any non-VMManaged state,
+// and fail-open on a CVI lookup error, matching every other VM-owned-volume
+// guard in this codebase (blocking unrelated operations on a CVI-service
+// hiccup is the worse failure).
+//
+// vmGoneCheck, when non-nil, is consulted before rejecting: if it confirms
+// the owning VM(s) no longer exist (most commonly because their namespace was
+// force-deleted), the operation is allowed instead of rejected — a gone VM
+// can never come back to release the volume, so continuing to block would
+// leave it stuck forever and get in the way of namespace cleanup. Callers for
+// which VM absence must not change the outcome (e.g. snapshot creation, where
+// the FCD stays permanently unregistered either way) pass nil.
+func assertNotVMManaged(ctx context.Context,
+	cviSvc csivolumeinfosvc.CsiVolumeInfoService, volumeID, operation string, vmGoneCheck vmGoneChecker) error {
+	log := logger.GetLogger(ctx)
+	cvi, err := cviSvc.GetCsiVolumeInfo(ctx, volumeID)
+	if err != nil {
+		log.Warnf("assertNotVMManaged: failed to get CsiVolumeInfo for volume %q: %v; "+
+			"allowing %s (fail-open)", volumeID, err, operation)
+		return nil
+	}
+	if cvi == nil || cvi.Status.Ownership != csivolumeinfov1alpha1.OwnershipStateVMManaged {
+		return nil
+	}
+	if vmGoneCheck != nil && vmGoneCheck(ctx, cvi.Spec.PVCNamespace, cvi.Spec.VMs) {
+		log.Infof("assertNotVMManaged: allowing %s for volume %q; the VM(s) that owned it no longer exist",
+			operation, volumeID)
+		return nil
+	}
+	return fmt.Errorf("volume %q is currently owned by a VM; %s is not allowed", volumeID, operation)
 }
 
 func (c *controller) UpdateCNSVolumeInfo(ctx context.Context, patch map[string]interface{}, volumeID string) error {

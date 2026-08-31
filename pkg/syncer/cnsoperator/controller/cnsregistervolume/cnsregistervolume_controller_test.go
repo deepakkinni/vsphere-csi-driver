@@ -52,6 +52,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	cnsregistervolumev1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/cnsregistervolume/v1alpha1"
+	csivolumeinfosvc "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo"
+	csivolumeinfov1alpha1 "sigs.k8s.io/vsphere-csi-driver/v3/pkg/apis/cnsoperator/csivolumeinfo/v1alpha1"
 	cnsvolume "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/volume"
 	cnsvsphere "sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/cns-lib/vsphere"
 	"sigs.k8s.io/vsphere-csi-driver/v3/pkg/common/config"
@@ -266,6 +268,28 @@ func (m *mockVolumeManager) SyncVolume(ctx context.Context,
 
 func (m *mockVolumeManager) ReRegisterVolume(ctx context.Context, volumeID string) error {
 	return nil
+}
+
+func (m *mockVolumeManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, string, error) {
+	return "", "", "", nil
+}
+
+func (m *mockVolumeManager) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManager) QueryDiskPathFromVM(ctx context.Context,
+	vmInstanceUUID, diskUUID string) (string, error) {
+	return "", nil
+}
+
+func (m *mockVolumeManager) QueryUnregisterFeasibility(ctx context.Context,
+	volumeIDs []string) ([]cnsvolume.UnregisterFeasibility, error) {
+	return nil, nil
 }
 
 type mockCOCommon struct{}
@@ -716,8 +740,52 @@ var _ = Describe("checkExistingPVCDataSourceRef", func() {
 
 	Context("when PVC does not exist", func() {
 		It("should return nil without error", func() {
-			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 			Expect(err).To(BeNil())
+			Expect(pvc).To(BeNil())
+		})
+	})
+
+	Context("when PVC is bound to a volume tracked by a CsiVolumeInfo", func() {
+		const volumeID = "cvi-tracked-volume-id"
+		var cviSvc csivolumeinfosvc.CsiVolumeInfoService
+
+		BeforeEach(func() {
+			pvName := "test-pv"
+			pv := &corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: pvName},
+				Spec: corev1.PersistentVolumeSpec{
+					PersistentVolumeSource: corev1.PersistentVolumeSource{
+						CSI: &corev1.CSIPersistentVolumeSource{VolumeHandle: volumeID},
+					},
+				},
+			}
+			_, err := k8sclient.CoreV1().PersistentVolumes().Create(ctx, pv, metav1.CreateOptions{})
+			Expect(err).To(BeNil())
+
+			pvc := &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: namespace},
+				Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+			}
+			_, err = k8sclient.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, pvc, metav1.CreateOptions{})
+			Expect(err).To(BeNil())
+
+			s := runtime.NewScheme()
+			Expect(csivolumeinfov1alpha1.AddToScheme(s)).To(Succeed())
+			cvi := &csivolumeinfov1alpha1.CsiVolumeInfo{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      csivolumeinfov1alpha1.CVINamePrefix + volumeID,
+					Namespace: csivolumeinfov1alpha1.CVINamespace,
+				},
+				Spec: csivolumeinfov1alpha1.CsiVolumeInfoSpec{VolumeID: volumeID},
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(cvi).Build()
+			cviSvc = csivolumeinfosvc.NewCsiVolumeInfoService(fakeClient)
+		})
+
+		It("should refuse to reuse the PVC rather than falling through to the DataSourceRef checks", func() {
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, cviSvc, pvcName, namespace)
+			Expect(err).ToNot(BeNil())
 			Expect(pvc).To(BeNil())
 		})
 	})
@@ -738,7 +806,7 @@ var _ = Describe("checkExistingPVCDataSourceRef", func() {
 		})
 
 		It("should return the PVC without error", func() {
-			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 			Expect(err).To(BeNil())
 			Expect(pvc).ToNot(BeNil())
 			Expect(pvc.Name).To(Equal(pvcName))
@@ -767,7 +835,7 @@ var _ = Describe("checkExistingPVCDataSourceRef", func() {
 		})
 
 		It("should return an error since VolumeSnapshots are not supported for CNSRegisterVolume", func() {
-			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 			Expect(err).ToNot(BeNil())
 			Expect(pvc).To(BeNil())
 		})
@@ -794,7 +862,7 @@ var _ = Describe("checkExistingPVCDataSourceRef", func() {
 		})
 
 		It("should return the PVC without error", func() {
-			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 			Expect(err).To(BeNil())
 			Expect(pvc).ToNot(BeNil())
 			Expect(pvc.Name).To(Equal(pvcName))
@@ -824,7 +892,7 @@ var _ = Describe("checkExistingPVCDataSourceRef", func() {
 		})
 
 		It("should return an error", func() {
-			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 			Expect(err).ToNot(BeNil())
 			Expect(pvc).To(BeNil())
 		})
@@ -850,7 +918,7 @@ var _ = Describe("checkExistingPVCDataSourceRef", func() {
 		})
 
 		It("should return an error for unsupported empty APIGroup", func() {
-			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 			Expect(err).ToNot(BeNil())
 			Expect(pvc).To(BeNil())
 		})
@@ -879,7 +947,7 @@ var _ = Describe("checkExistingPVCDataSourceRef", func() {
 		})
 
 		It("should return the PVC with volumeMode set", func() {
-			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 			Expect(err).To(BeNil())
 			Expect(pvc).ToNot(BeNil())
 			Expect(pvc.Name).To(Equal(pvcName))
@@ -934,7 +1002,7 @@ var _ = Describe("PV capacity from PVC with DataSourceRef", func() {
 		})
 
 		It("checkExistingPVCDataSourceRef returns the PVC with storage request 8529897472", func() {
-			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+			pvc, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 			Expect(err).To(BeNil())
 			Expect(pvc).ToNot(BeNil())
 			Expect(pvc.Spec.DataSourceRef).ToNot(BeNil())
@@ -1694,7 +1762,7 @@ func TestPVCapacityFromPVCWithDataSourceRef(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify checkExistingPVCDataSourceRef returns PVC with correct request
-	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, pvcName, namespace)
+	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, pvcName, namespace)
 	assert.NoError(t, err)
 	assert.NotNil(t, existingPVC)
 	assert.NotNil(t, existingPVC.Spec.DataSourceRef)
@@ -1767,7 +1835,7 @@ func TestVolumeModeInheritanceFromExistingPVCWithDataSourceRef(t *testing.T) {
 	}
 
 	// Simulate the logic from the Reconcile function
-	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, instance.Spec.PvcName, instance.Namespace)
+	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, instance.Spec.PvcName, instance.Namespace)
 	assert.NoError(t, err)
 	assert.NotNil(t, existingPVC)
 
@@ -1829,7 +1897,7 @@ func TestVolumeModeNotInheritedWhenAlreadySet(t *testing.T) {
 	originalVolumeMode := instance.Spec.VolumeMode
 
 	// Simulate the logic from the Reconcile function
-	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, instance.Spec.PvcName, instance.Namespace)
+	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, instance.Spec.PvcName, instance.Namespace)
 	assert.NoError(t, err)
 	assert.NotNil(t, existingPVC)
 
@@ -1886,7 +1954,7 @@ func TestVolumeModeNotInheritedWhenNoDataSourceRef(t *testing.T) {
 	}
 
 	// Simulate the logic from the Reconcile function
-	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, instance.Spec.PvcName, instance.Namespace)
+	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, instance.Spec.PvcName, instance.Namespace)
 	assert.NoError(t, err)
 	assert.NotNil(t, existingPVC)
 
@@ -1946,7 +2014,7 @@ func TestVolumeModeNotInheritedWhenPVCVolumeModeIsNil(t *testing.T) {
 	}
 
 	// Simulate the logic from the Reconcile function
-	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, instance.Spec.PvcName, instance.Namespace)
+	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, instance.Spec.PvcName, instance.Namespace)
 	assert.NoError(t, err)
 	assert.NotNil(t, existingPVC)
 
@@ -2007,7 +2075,7 @@ func TestVolumeModeMatchesExistingPVC(t *testing.T) {
 	}
 
 	// Simulate the logic from the Reconcile function
-	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, instance.Spec.PvcName, instance.Namespace)
+	existingPVC, err := checkExistingPVCDataSourceRef(ctx, k8sclient, nil, instance.Spec.PvcName, instance.Namespace)
 	assert.NoError(t, err)
 	assert.NotNil(t, existingPVC)
 

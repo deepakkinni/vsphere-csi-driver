@@ -235,3 +235,46 @@ func (m MockManager) QueryFCDChangedBlocks(ctx context.Context,
 	//TODO implement me
 	panic("implement me")
 }
+
+// UnregisterVolumeEx is the mock implementation of the CNS unregister call.
+// Returns the configured error and fault type on failure, otherwise empty
+// backing-disk path and disk UUID.
+func (m MockManager) UnregisterVolumeEx(ctx context.Context, volumeID string) (string, string, string, error) {
+	if m.failRequest {
+		return "", "", m.faultType, m.err
+	}
+	return "", "", "", nil
+}
+
+// QueryLiveDiskPath is the mock implementation of the live disk-path read.
+// Returns the configured error on failure, otherwise an empty path.
+func (m MockManager) QueryLiveDiskPath(ctx context.Context, volumeID string) (string, error) {
+	if m.failRequest {
+		return "", m.err
+	}
+	return "", nil
+}
+
+// QueryDiskPathFromVM is the mock implementation of the VM-backed disk-path
+// read. Returns the configured error on failure, otherwise an empty path.
+func (m MockManager) QueryDiskPathFromVM(ctx context.Context, vmInstanceUUID, diskUUID string) (string, error) {
+	if m.failRequest {
+		return "", m.err
+	}
+	return "", nil
+}
+
+// QueryUnregisterFeasibility is the mock implementation of the feasibility
+// query. Returns the configured error on failure, otherwise an empty result set.
+func (m MockManager) QueryUnregisterFeasibility(ctx context.Context,
+	volumeIDs []string) ([]UnregisterFeasibility, error) {
+	if m.failRequest {
+		return nil, m.err
+	}
+	return nil, nil
+}
+
+// GetDiskFolderURL is the mock implementation; always returns an empty string.
+func (m MockManager) GetDiskFolderURL(ctx context.Context, datastorePath string) (string, error) {
+	return "", nil
+}
