@@ -682,6 +682,10 @@ const (
 	// is resolved per namespace (NetworkSettings CR) rather than from the global wcp-network-config.
 	SupportsPerNamespaceNetworkProviders = "supports_per_namespace_network_provider"
 
+	// VSphereCSIRuntimeConfig enables Supervisor credentials and file-volume settings from API
+	// resources, and trust-bundle rotation through a ConfigMap volume.
+	VSphereCSIRuntimeConfig = "vsphere-csi-runtime-config"
+
 	// ImprovedVolumeVisibility is the FSS that gates improved volume
 	// visibility in guest cluster, when enabled it enables guest cluster
 	// related annotations and other visibility enhancements for better
